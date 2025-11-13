@@ -1697,3 +1697,343 @@ class TaskOut(TaskBase):
 
     class Config:
         from_attributes = True
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+without logging and using wnum ------
+from enum import Enum
+from typing import List
+from app.exceptions.handlers import InvalidStatusError, InvalidStatusTransitionError
+
+class TaskStatus(str, Enum):
+    NOT_STARTED = "not_started"
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+
+STATUS_WORKFLOW: List[TaskStatus] = [
+    TaskStatus.NOT_STARTED,
+    TaskStatus.PENDING,
+    TaskStatus.IN_PROGRESS,
+    TaskStatus.COMPLETED
+]
+
+def validate_status_value(status_value: str) -> TaskStatus:
+    try:
+        return TaskStatus(status_value)
+    except ValueError:
+        valid_values = [status.value for status in TaskStatus]
+        raise InvalidStatusError(status_value, valid_values)
+
+def validate_status_transition(current_status: str, new_status: str) -> None:
+    current_enum = validate_status_value(current_status)
+    new_enum = validate_status_value(new_status)
+    
+    current_index = STATUS_WORKFLOW.index(current_enum)
+    new_index = STATUS_WORKFLOW.index(new_enum)
+    
+    if new_index < current_index:
+        raise InvalidStatusTransitionError(current_status, new_status)
+
+
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import SQLAlchemyError, IntegrityError
+from app.database.database import get_db
+from app.schemas.schemas import TaskCreate, TaskUpdate, TaskOut
+from app.models.models import Task
+from app.utils.enums import TaskStatus, STATUS_WORKFLOW, validate_status_value, validate_status_transition
+from app.exceptions.handlers import (
+    TaskNotFoundError, InvalidStatusTransitionError, 
+    InvalidStatusError, EmptyTitleError, DatabaseError
+)
+from typing import List, Optional
+
+router = APIRouter()
+
+def validate_task_data(task_data: TaskCreate) -> None:
+    if not task_data.title or not task_data.title.strip():
+        raise EmptyTitleError()
+    
+    if len(task_data.title.strip()) > 200:
+        raise InvalidStatusError(
+            "Title too long", 
+            ["Title must be less than 200 characters"]
+        )
+    
+    # Status validation is handled by Pydantic validator with custom error
+
+def validate_status_transition(current_status: str, new_status: str) -> None:
+    # Convert strings to enums for workflow validation
+    current_enum = validate_status_value(current_status)
+    new_enum = validate_status_value(new_status)
+    
+    current_index = STATUS_WORKFLOW.index(current_enum)
+    new_index = STATUS_WORKFLOW.index(new_enum)
+    
+    if new_index < current_index:
+        raise InvalidStatusTransitionError(current_status, new_status)
+
+# CREATE Task
+@router.post('/', response_model=TaskOut, status_code=201)
+def create_task(task_data: TaskCreate, db: Session = Depends(get_db)):
+    try:
+        validate_task_data(task_data)
+        
+        task = Task(**task_data.model_dump())
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        return task
+        
+    except (EmptyTitleError, InvalidStatusError):
+        db.rollback()
+        raise
+    except IntegrityError:
+        db.rollback()
+        raise DatabaseError("task creation - possible duplicate or constraint violation")
+    except SQLAlchemyError:
+        db.rollback()
+        raise DatabaseError("task creation")
+    except Exception:
+        db.rollback()
+        raise
+
+# GET Tasks
+@router.get("/", response_model=List[TaskOut])
+def get_tasks(
+    db: Session = Depends(get_db),
+    task_id: Optional[int] = Query(default=None, description='Optional Task ID to fetch a specific task'),
+    status: Optional[str] = Query(default=None, description='Filter by status'),
+    skip: int = Query(0, ge=0, description='Number of records to skip'),
+    limit: int = Query(100, ge=1, le=1000, description='Number of records to return')
+):
+    try:
+        # Validate status filter using our custom validation
+        if status:
+            validate_status_value(status)
+        
+        if task_id:
+            task = db.query(Task).filter(Task.id == task_id).first()
+            if not task:
+                raise TaskNotFoundError(task_id)
+            return [task]
+        
+        query = db.query(Task)
+        if status:
+            query = query.filter(Task.status == status)
+        
+        tasks = query.order_by(Task.id).offset(skip).limit(limit).all()
+        
+        if not tasks and (task_id is not None or status is not None):
+            raise TaskNotFoundError(task_id if task_id else 0)
+            
+        return tasks
+        
+    except (TaskNotFoundError, InvalidStatusError):
+        raise
+    except SQLAlchemyError:
+        raise DatabaseError("fetching tasks")
+    except Exception:
+        raise
+
+# UPDATE Task
+@router.put("/{task_id}", response_model=TaskOut)
+def update_task(task_id: int, update_data: TaskUpdate, db: Session = Depends(get_db)):
+    try:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        if not task:
+            raise TaskNotFoundError(task_id)
+        
+        if update_data.title is not None:
+            if not update_data.title.strip():
+                raise EmptyTitleError()
+            if len(update_data.title.strip()) > 200:
+                raise InvalidStatusError(
+                    "Title too long", 
+                    ["Title must be less than 200 characters"]
+                )
+        
+        if update_data.status is not None and update_data.status != task.status:
+            validate_status_transition(task.status, update_data.status)
+        
+        update_dict = update_data.model_dump(exclude_unset=True)
+        for key, value in update_dict.items():
+            setattr(task, key, value)
+        
+        db.commit()
+        db.refresh(task)
+        return task
+        
+    except (TaskNotFoundError, EmptyTitleError, InvalidStatusError, InvalidStatusTransitionError):
+        db.rollback()
+        raise
+    except IntegrityError:
+        db.rollback()
+        raise DatabaseError("task update - possible constraint violation")
+    except SQLAlchemyError:
+        db.rollback()
+        raise DatabaseError("task update")
+    except Exception:
+        db.rollback()
+        raise
+
+# DELETE Task
+@router.delete("/{task_id}", status_code=200)
+def delete_task(task_id: int, db: Session = Depends(get_db)):
+    try:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        if not task:
+            raise TaskNotFoundError(task_id)
+        
+        db.delete(task)
+        db.commit()
+        return {
+            "success": True,
+            "message": f"Task with ID {task_id} deleted successfully."
+        }
+        
+    except TaskNotFoundError:
+        db.rollback()
+        raise
+    except SQLAlchemyError:
+        db.rollback()
+        raise DatabaseError("task deletion")
+    except Exception:
+        db.rollback()
+        raise
+
+
+
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, CheckConstraint
+from sqlalchemy.sql import func
+from app.database.database import Base
+from app.utils.enums import TaskStatus
+
+class Task(Base):
+    __tablename__ = "tasks"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    title = Column(String(200), index=True, nullable=False)
+    description = Column(String(1000), nullable=True)
+    completed = Column(Boolean, default=False)
+    status = Column(String(20), default=TaskStatus.NOT_STARTED.value, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            f"status IN ('{TaskStatus.NOT_STARTED.value}', '{TaskStatus.PENDING.value}', '{TaskStatus.IN_PROGRESS.value}', '{TaskStatus.COMPLETED.value}')",
+            name='valid_status_check'
+        ),
+        CheckConstraint(
+            "length(trim(title)) > 0",
+            name='non_empty_title_check'
+        ),
+    )
+
+
+from pydantic import BaseModel, Field, validator
+from typing import Optional
+from datetime import datetime
+from app.utils.enums import TaskStatus, validate_status_value
+from app.exceptions.handlers import InvalidStatusError, EmptyTitleError
+
+class TaskBase(BaseModel):
+    title: str = Field(..., min_length=1, max_length=200)
+    description: Optional[str] = Field(None, max_length=1000)
+    status: str = Field(default="not_started")
+
+    @validator('status')
+    def validate_status(cls, v):
+        if v is None:
+            return TaskStatus.NOT_STARTED.value
+        
+        # Use our custom validation with custom error messages
+        try:
+            validate_status_value(v)
+            return v
+        except InvalidStatusError:
+            # Re-raise to maintain custom error message
+            raise
+
+    @validator('title')
+    def validate_title(cls, v):
+        if not v or not v.strip():
+            raise EmptyTitleError()
+        return v.strip()
+
+class TaskCreate(TaskBase):
+    pass
+
+class TaskUpdate(BaseModel):
+    title: Optional[str] = Field(None, min_length=1, max_length=200)
+    description: Optional[str] = Field(None, max_length=1000)
+    completed: Optional[bool] = None
+    status: Optional[str] = None
+
+    @validator('status')
+    def validate_status(cls, v):
+        if v is None:
+            return None
+        
+        try:
+            validate_status_value(v)
+            return v
+        except InvalidStatusError:
+            raise
+
+    @validator('title')
+    def validate_title(cls, v):
+        if v is not None:
+            if not v.strip():
+                raise EmptyTitleError()
+            return v.strip()
+        return v
+
+class TaskOut(TaskBase):
+    id: int
+    completed: bool
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+
+from enum import Enum
+from typing import List
+from app.exceptions.handlers import InvalidStatusError
+
+class TaskStatus(str, Enum):
+    NOT_STARTED = "not_started"
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+
+STATUS_WORKFLOW: List[TaskStatus] = [
+    TaskStatus.NOT_STARTED,
+    TaskStatus.PENDING,
+    TaskStatus.IN_PROGRESS,
+    TaskStatus.COMPLETED
+]
+
+def validate_status_value(status_value: str) -> TaskStatus:
+    try:
+        return TaskStatus(status_value)
+    except ValueError:
+        valid_values = [status.value for status in TaskStatus]
+        raise InvalidStatusError(status_value, valid_values)
