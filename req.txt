@@ -2037,3 +2037,273 @@ def validate_status_value(status_value: str) -> TaskStatus:
     except ValueError:
         valid_values = [status.value for status in TaskStatus]
         raise InvalidStatusError(status_value, valid_values)
+
+
+
+
+
+import uvicorn
+from fastapi import FastAPI, Depends
+from sqlalchemy.orm import Session
+from app.config.settings import settings
+from app.database.database import Base, engine, get_db
+from app.routers.tasks import router as tasks_router
+from app.models.models import Task
+from app.exceptions.handlers import setup_exception_handlers
+
+# Create database tables
+Base.metadata.create_all(bind=engine)
+
+app = FastAPI(
+    title=settings.APP_NAME,
+    version=settings.API_VERSION,
+    description="Task Management API with Enum-based status validation",
+    debug=settings.DEBUG
+)
+
+# Setup exception handlers - IMPORTANT: This must be called
+setup_exception_handlers(app)
+
+# Include router
+app.include_router(
+    tasks_router,
+    prefix=f"/api/{settings.API_VERSION}/tasks",
+    tags=["Tasks"]
+)
+
+@app.get("/health")
+def health_check():
+    return {
+        "success": True,
+        "status": "ok", 
+        "message": "FastAPI server is running",
+        "version": settings.API_VERSION
+    }
+
+@app.get("/")
+def root():
+    return {
+        "message": "Welcome to Task Management API!",
+        "docs": "/docs",
+        "health": "/health",
+        "api_version": settings.API_VERSION
+    }
+
+@app.get("/debug")
+def debug_info(db: Session = Depends(get_db)):
+    """Debug endpoint to check database and enum setup"""
+    try:
+        task_count = db.query(Task).count()
+        return {
+            "success": True,
+            "database_status": "connected",
+            "total_tasks": task_count,
+            "available_statuses": ["not_started", "pending", "in_progress", "completed"]
+        }
+    except Exception:
+        return {
+            "success": False,
+            "database_status": "disconnected",
+            "error": "Cannot connect to database"
+        }
+
+if __name__ == "__main__":
+    uvicorn.run(
+        "app.main:app", 
+        host="0.0.0.0", 
+        port=8000,
+        reload=settings.DEBUG
+    )
+
+
+
+
+
+
+from fastapi import FastAPI, Request, status
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from sqlalchemy.exc import SQLAlchemyError, IntegrityError
+from typing import Any, Dict
+from pydantic import ValidationError
+
+class CustomHTTPException(Exception):
+    def __init__(self, status_code: int, detail: str, headers: Dict[str, Any] = None):
+        self.status_code = status_code
+        self.detail = detail
+        self.headers = headers
+
+class TaskNotFoundError(CustomHTTPException):
+    def __init__(self, task_id: int):
+        super().__init__(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Task with ID {task_id} not found."
+        )
+
+class InvalidStatusTransitionError(CustomHTTPException):
+    def __init__(self, current_status: str, new_status: str):
+        super().__init__(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f'Invalid status transition. Cannot move backward from "{current_status}" to "{new_status}". Allowed workflow: not_started → pending → in_progress → completed'
+        )
+
+class InvalidStatusError(CustomHTTPException):
+    def __init__(self, status_value: str, allowed_values: list):
+        super().__init__(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid status '{status_value}'. Must be one of: {', '.join(allowed_values)}"
+        )
+
+class EmptyTitleError(CustomHTTPException):
+    def __init__(self):
+        super().__init__(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Title cannot be empty or contain only whitespace"
+        )
+
+class DatabaseError(CustomHTTPException):
+    def __init__(self, operation: str):
+        super().__init__(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database error during {operation}. Please try again later."
+        )
+
+def setup_exception_handlers(app: FastAPI):
+    
+    @app.exception_handler(CustomHTTPException)
+    async def custom_http_exception_handler(request: Request, exc: CustomHTTPException):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "success": False,
+                "error": {
+                    "code": exc.__class__.__name__,
+                    "message": exc.detail,
+                    "path": request.url.path
+                }
+            },
+            headers=exc.headers
+        )
+    
+    @app.exception_handler(InvalidStatusError)
+    async def invalid_status_handler(request: Request, exc: InvalidStatusError):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "success": False,
+                "error": {
+                    "code": "INVALID_STATUS",
+                    "message": exc.detail,
+                    "path": request.url.path
+                }
+            },
+            headers=exc.headers
+        )
+    
+    @app.exception_handler(RequestValidationError)
+    async def validation_exception_handler(request: Request, exc: RequestValidationError):
+        """Custom validation error handler that shows our custom error messages"""
+        errors = []
+        for error in exc.errors():
+            field_path = " -> ".join(str(loc) for loc in error['loc'])
+            
+            # Check if this is a custom error from our validators
+            if error['type'] == 'value_error' and 'ctx' in error:
+                # This might be our custom error, use the original message
+                if 'CustomHTTPException' in str(error.get('ctx', {})):
+                    # Extract our custom message
+                    errors.append({
+                        "field": field_path,
+                        "message": error['msg'],
+                        "type": "custom_validation"
+                    })
+                elif 'enum' in error.get('ctx', {}):
+                    errors.append({
+                        "field": field_path,
+                        "message": f"Invalid value. Must be one of: {', '.join(error['ctx']['expected'])}",
+                        "type": "invalid_choice"
+                    })
+                else:
+                    errors.append({
+                        "field": field_path,
+                        "message": error['msg'],
+                        "type": error['type']
+                    })
+            elif error['type'] == 'string_too_long':
+                errors.append({
+                    "field": field_path,
+                    "message": f"Value too long. Maximum length is {error['ctx']['max_length']} characters",
+                    "type": "length_exceeded"
+                })
+            elif error['type'] == 'string_too_short':
+                errors.append({
+                    "field": field_path,
+                    "message": f"Value too short. Minimum length is {error['ctx']['min_length']} characters",
+                    "type": "too_short"
+                })
+            elif error['type'] == 'missing':
+                errors.append({
+                    "field": field_path,
+                    "message": "This field is required",
+                    "type": "required_field"
+                })
+            else:
+                errors.append({
+                    "field": field_path,
+                    "message": error['msg'],
+                    "type": error['type']
+                })
+        
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={
+                "success": False,
+                "error": {
+                    "code": "VALIDATION_ERROR",
+                    "message": "Please check your input data",
+                    "details": errors
+                }
+            }
+        )
+    
+    @app.exception_handler(SQLAlchemyError)
+    async def sqlalchemy_exception_handler(request: Request, exc: SQLAlchemyError):
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "success": False,
+                "error": {
+                    "code": "DATABASE_ERROR",
+                    "message": "A database error occurred",
+                    "path": request.url.path
+                }
+            }
+        )
+    
+    @app.exception_handler(IntegrityError)
+    async def integrity_error_handler(request: Request, exc: IntegrityError):
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "success": False,
+                "error": {
+                    "code": "INTEGRITY_ERROR",
+                    "message": "Data integrity violation",
+                    "path": request.url.path
+                }
+            }
+        )
+    
+    @app.exception_handler(Exception)
+    async def general_exception_handler(request: Request, exc: Exception):
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "success": False,
+                "error": {
+                    "code": "INTERNAL_SERVER_ERROR",
+                    "message": "An unexpected error occurred",
+                    "path": request.url.path
+                }
+            }
+        )
