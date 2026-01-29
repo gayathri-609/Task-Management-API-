@@ -1,2309 +1,745 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy.orm import Sessin
-from app.database.database import get_db
-from app.schemas.schemas import TaskCreate, TaskUpdate, TaskOut
-from app.models.models import Task
-from typing import List, Optional
+dq_config_api/models/config_details.py
+import datetime
+from typing import Literal, List, Union, Optional
 
-router = APIRouter()
+from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import select, union_all, text
 
-STATUS_FLOW = ["not_started", "pending", "in_progress", "completed"]
+from dq_config_api import database
+from dq_config_api.consts import READABLE_STATUSES
+from dq_config_api.enums import PassFail, Active
+from dq_config_api.exceptions import DoesNotExistsException
+from dq_config_api.models.execution_results import get_execution_result
+from dq_config_api.models.table import Table
+from dq_config_api.pagination import PaginatedFilters, PaginatedModel
 
-
-# ✅ CREATE Task
-@router.post("/", response_model=TaskOut, status_code=201)
-def create_task(task_data: TaskCreate, db: Session = Depends(get_db)):
-    try:
-        # Validate status
-        if task_data.status not in STATUS_FLOW:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid status value. Allowed values are: {', '.join(STATUS_FLOW)}"
-            )
-
-        # Create new task
-        task = Task(**task_data.model_dump())
-        db.add(task)
-        db.commit()
-        db.refresh(task)
-        return task
-
-    except HTTPException as e:
-        raise e
-    except Exception:
-        db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="An unexpected error occurred while creating the task. Please try again later."
-        )
+TABLE_MAPPING = {
+    "id": "Id",
+    "file_name": "File Name",
+    "status": "Status",
+    "logs": "Logs",
+    "action": "Action",
+    "cosmos_url": "COSMOS File",
+    "result": "Result"
+}
 
 
-# ✅ GET & GET BY ID Combined
-@router.get("/", response_model=List[TaskOut])
-def get_tasks(
-    db: Session = Depends(get_db),
-    task_id: Optional[int] = Query(default=None, description="Optional Task ID to fetch a specific task")
-):
-    try:
-        if task_id:
-            task = db.query(Task).filter(Task.id == task_id).first()
-            if not task:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f"No task found with ID {task_id}."
-                )
-            return [task]  # returning a list for consistent response_model type
-
-        tasks = db.query(Task).order_by(Task.id).all()
-        if not tasks:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="No tasks available."
-            )
-        return tasks
-
-    except HTTPException as e:
-        raise e
-    except Exception:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Unable to fetch tasks. Please try again later."
-        )
-
-
-# ✅ UPDATE Task (with cyclic flow validation)
-@router.put("/{task_id}", response_model=TaskOut)
-def update_task(task_id: int, update_data: TaskUpdate, db: Session = Depends(get_db)):
-    try:
-        task = db.query(Task).filter(Task.id == task_id).first()
-        if not task:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Task with ID {task_id} not found."
-            )
-
-        # Enforce cyclic flow if status is being updated
-        if update_data.status:
-            current_status = task.status
-            new_status = update_data.status
-
-            if current_status not in STATUS_FLOW or new_status not in STATUS_FLOW:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Invalid status. Allowed values are: {', '.join(STATUS_FLOW)}"
-                )
-
-            current_index = STATUS_FLOW.index(current_status)
-            new_index = STATUS_FLOW.index(new_status)
-
-            if new_index < current_index:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Invalid status transition. Cannot move backward from '{current_status}' to '{new_status}'."
-                )
-
-        update_dict = update_data.model_dump(exclude_unset=True)
-        for key, value in update_dict.items():
-            setattr(task, key, value)
-
-        db.commit()
-        db.refresh(task)
-        return task
-
-    except HTTPException as e:
-        raise e
-    except Exception:
-        db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Something went wrong while updating the task. Please try again later."
-        )
-
-
-# ✅ DELETE Task
-@router.delete("/{task_id}", status_code=200)
-def delete_task(task_id: int, db: Session = Depends(get_db)):
-    try:
-        task = db.query(Task).filter(Task.id == task_id).first()
-        if not task:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Task with ID {task_id} not found."
-            )
-
-        db.delete(task)
-        db.commit()
-        return {"message": f"Task with ID {task_id} deleted successfully."}
-
-    except HTTPException as e:
-        raise e
-    except Exception:
-        db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to delete the task due to an internal error. Please try again later."
-
-        )
-
-
-
-# app/exceptions/handlers.py
-from fastapi import FastAPI, Request, status
-from fastapi.responses import JSONResponse
-from fastapi.exceptions import RequestValidationError
-from sqlalchemy.exc import SQLAlchemyError, IntegrityError
-from typing import Any, Dict
-
-class CustomHTTPException(Exception):
-    def __init__(self, status_code: int, detail: str, headers: Dict[str, Any] = None):
-        self.status_code = status_code
-        self.detail = detail
-        self.headers = headers
-
-class TaskNotFoundError(CustomHTTPException):
-    def __init__(self, task_id: int):
-        super().__init__(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Task with ID {task_id} not found."
-        )
-
-class InvalidStatusTransitionError(CustomHTTPException):
-    def __init__(self, current_status: str, new_status: str):
-        super().__init__(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f'Invalid status transition. Cannot move backward from "{current_status}" to "{new_status}"'
-        )
-
-class InvalidStatusError(CustomHTTPException):
-    def __init__(self, status_value: str, allowed_values: list):
-        super().__init__(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid status value '{status_value}'. Allowed values are: {', '.join(allowed_values)}"
-        )
-
-class EmptyTitleError(CustomHTTPException):
-    def __init__(self):
-        super().__init__(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Title cannot be empty or contain only whitespace"
-        )
-
-class DatabaseError(CustomHTTPException):
-    def __init__(self, operation: str):
-        super().__init__(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database error during {operation}. Please try again later."
-        )
-
-def setup_exception_handlers(app: FastAPI):
-    
-    @app.exception_handler(CustomHTTPException)
-    async def custom_http_exception_handler(request: Request, exc: CustomHTTPException):
-        return JSONResponse(
-            status_code=exc.status_code,
-            content={
-                "success": False,
-                "error": {
-                    "code": exc.__class__.__name__,
-                    "message": exc.detail,
-                    "path": request.url.path
-                }
-            },
-            headers=exc.headers
-        )
-    
-    @app.exception_handler(RequestValidationError)
-    async def validation_exception_handler(request: Request, exc: RequestValidationError):
-        errors = []
-        for error in exc.errors():
-            errors.append({
-                "field": " -> ".join(str(loc) for loc in error['loc']),
-                "message": error['msg'],
-                "type": error['type']
-            })
-        
-        return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            content={
-                "success": False,
-                "error": {
-                    "code": "VALIDATION_ERROR",
-                    "message": "Request validation failed",
-                    "details": errors
-                }
-            }
-        )
-    
-    @app.exception_handler(SQLAlchemyError)
-    async def sqlalchemy_exception_handler(request: Request, exc: SQLAlchemyError):
-        # Log the actual error for debugging
-        print(f"Database error: {str(exc)}")
-        
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={
-                "success": False,
-                "error": {
-                    "code": "DATABASE_ERROR",
-                    "message": "A database error occurred",
-                    "path": request.url.path
-                }
-            }
-        )
-    
-    @app.exception_handler(IntegrityError)
-    async def integrity_error_handler(request: Request, exc: IntegrityError):
-        return JSONResponse(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            content={
-                "success": False,
-                "error": {
-                    "code": "INTEGRITY_ERROR",
-                    "message": "Data integrity violation (e.g., duplicate entry, foreign key constraint)",
-                    "path": request.url.path
-                }
-            }
-        )
-    
-    @app.exception_handler(500)
-    @app.exception_handler(Exception)
-    async def general_exception_handler(request: Request, exc: Exception):
-        # Log the full exception for debugging
-        print(f"Unexpected error: {str(exc)}")
-        
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={
-                "success": False,
-                "error": {
-                    "code": "INTERNAL_SERVER_ERROR",
-                    "message": "An unexpected error occurred",
-                    "path": request.url.path
-                }
-            }
-        )
-
-
-# app/database/database.py
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy.exc import SQLAlchemyError
-from app.config.settings import settings
-from app.exceptions.handlers import DatabaseError
-import logging
-
-logger = logging.getLogger(__name__)
-
-SQLALCHEMY_DATABASE_URL = settings.DATABASE_URL
-
-engine = create_engine(
-    SQLALCHEMY_DATABASE_URL, 
-    connect_args={"check_same_thread": False},
-    pool_pre_ping=True,  # Check connection before using
-    echo=settings.DEBUG   # Log SQL queries in debug mode
-)
-
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-        db.commit()
-    except SQLAlchemyError as e:
-        logger.error(f"Database error: {str(e)}")
-        db.rollback()
-        raise DatabaseError("database operation") from e
-    except Exception as e:
-        logger.error(f"Unexpected error in database session: {str(e)}")
-        db.rollback()
-        raise
-    finally:
-        db.close()
-
-
-# app/models/models.py
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, CheckConstraint
-from sqlalchemy.sql import func
-from app.database.database import Base
-
-class Task(Base):
-    __tablename__ = "tasks"
-
-    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    title = Column(String(200), index=True, nullable=False)  # Added length constraint
-    description = Column(String(1000), nullable=True)  # Added length constraint
-    completed = Column(Boolean, default=False)
-    status = Column(String(20), default="pending", nullable=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
-
-    # Database-level constraints
-    __table_args__ = (
-        CheckConstraint(
-            "status IN ('not_started', 'pending', 'in_progress', 'completed')",
-            name='valid_status_check'
-        ),
-        CheckConstraint(
-            "length(trim(title)) > 0",
-            name='non_empty_title_check'
-        ),
+class DQConfigDetailsFilters(PaginatedFilters):
+    team_id: int = Field(
+        description="Team id",
+        examples=["1"],
     )
 
-
-
-
-# app/routers/tasks.py
-from fastapi import APIRouter, Depends, Query
-from sqlalchemy.orm import Session
-from sqlalchemy.exc import SQLAlchemyError, IntegrityError
-from app.database.database import get_db
-from app.schemas.schemas import TaskCreate, TaskUpdate, TaskOut
-from app.models.models import Task
-from app.exceptions.handlers import (
-    TaskNotFoundError, InvalidStatusTransitionError, 
-    InvalidStatusError, EmptyTitleError, DatabaseError
-)
-from typing import List, Optional
-import logging
-
-logger = logging.getLogger(__name__)
-
-router = APIRouter()
-
-STATUS_FLOW = ["not_started", "pending", "in_progress", "completed"]
-
-def validate_task_data(task_data: TaskCreate) -> None:
-    """Validate task data before database operations"""
-    # Title validation
-    if not task_data.title or not task_data.title.strip():
-        raise EmptyTitleError()
-    
-    # Title length validation
-    if len(task_data.title.strip()) > 200:
-        raise InvalidStatusError(
-            "Title too long", 
-            ["Title must be less than 200 characters"]
-        )
-    
-    # Status validation
-    if task_data.status and task_data.status not in STATUS_FLOW:
-        raise InvalidStatusError(task_data.status, STATUS_FLOW)
-
-def validate_status_transition(current_status: str, new_status: str) -> None:
-    """Validate status transition follows the correct flow"""
-    if new_status not in STATUS_FLOW:
-        raise InvalidStatusError(new_status, STATUS_FLOW)
-    
-    current_index = STATUS_FLOW.index(current_status)
-    new_index = STATUS_FLOW.index(new_status)
-    
-    if new_index < current_index:
-        raise InvalidStatusTransitionError(current_status, new_status)
-
-# CREATE Task
-@router.post('/', response_model=TaskOut, status_code=201)
-def create_task(task_data: TaskCreate, db: Session = Depends(get_db)):
-    try:
-        # Validate input data
-        validate_task_data(task_data)
-        
-        # Create new task
-        task = Task(**task_data.model_dump())
-        db.add(task)
-        db.commit()
-        db.refresh(task)
-        
-        logger.info(f"Task created successfully with ID: {task.id}")
-        return task
-        
-    except (EmptyTitleError, InvalidStatusError):
-        db.rollback()
-        raise
-    except IntegrityError as e:
-        db.rollback()
-        logger.error(f"Integrity error while creating task: {str(e)}")
-        raise DatabaseError("task creation - possible duplicate or constraint violation")
-    except SQLAlchemyError as e:
-        db.rollback()
-        logger.error(f"Database error while creating task: {str(e)}")
-        raise DatabaseError("task creation")
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Unexpected error while creating task: {str(e)}")
-        raise
-
-# GET Tasks
-@router.get("/", response_model=List[TaskOut])
-def get_tasks(
-    db: Session = Depends(get_db),
-    task_id: Optional[int] = Query(default=None, description='Optional Task ID to fetch a specific task'),
-    status: Optional[str] = Query(default=None, description='Filter by status'),
-    skip: int = Query(0, ge=0, description='Number of records to skip'),
-    limit: int = Query(100, ge=1, le=1000, description='Number of records to return')
-):
-    try:
-        # Validate status filter if provided
-        if status and status not in STATUS_FLOW:
-            raise InvalidStatusError(status, STATUS_FLOW)
-        
-        if task_id:
-            task = db.query(Task).filter(Task.id == task_id).first()
-            if not task:
-                raise TaskNotFoundError(task_id)
-            return [task]
-        
-        # Build query with filters
-        query = db.query(Task)
-        if status:
-            query = query.filter(Task.status == status)
-        
-        tasks = query.order_by(Task.id).offset(skip).limit(limit).all()
-        
-        if not tasks and (task_id is not None or status is not None):
-            raise TaskNotFoundError(task_id if task_id else 0)
-            
-        return tasks
-        
-    except (TaskNotFoundError, InvalidStatusError):
-        raise
-    except SQLAlchemyError as e:
-        logger.error(f"Database error while fetching tasks: {str(e)}")
-        raise DatabaseError("fetching tasks")
-    except Exception as e:
-        logger.error(f"Unexpected error while fetching tasks: {str(e)}")
-        raise
-
-# UPDATE Task
-@router.put("/{task_id}", response_model=TaskOut)
-def update_task(task_id: int, update_data: TaskUpdate, db: Session = Depends(get_db)):
-    try:
-        task = db.query(Task).filter(Task.id == task_id).first()
-        if not task:
-            raise TaskNotFoundError(task_id)
-        
-        # Validate title if provided
-        if update_data.title is not None:
-            if not update_data.title.strip():
-                raise EmptyTitleError()
-            if len(update_data.title.strip()) > 200:
-                raise InvalidStatusError(
-                    "Title too long", 
-                    ["Title must be less than 200 characters"]
-                )
-        
-        # Validate status transition if status is being updated
-        if update_data.status is not None and update_data.status != task.status:
-            validate_status_transition(task.status, update_data.status)
-        
-        # Update task
-        update_dict = update_data.model_dump(exclude_unset=True)
-        for key, value in update_dict.items():
-            setattr(task, key, value)
-        
-        db.commit()
-        db.refresh(task)
-        
-        logger.info(f"Task with ID {task_id} updated successfully")
-        return task
-        
-    except (TaskNotFoundError, EmptyTitleError, InvalidStatusError, InvalidStatusTransitionError):
-        db.rollback()
-        raise
-    except IntegrityError as e:
-        db.rollback()
-        logger.error(f"Integrity error while updating task {task_id}: {str(e)}")
-        raise DatabaseError("task update - possible constraint violation")
-    except SQLAlchemyError as e:
-        db.rollback()
-        logger.error(f"Database error while updating task {task_id}: {str(e)}")
-        raise DatabaseError("task update")
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Unexpected error while updating task {task_id}: {str(e)}")
-        raise
-
-# DELETE Task
-@router.delete("/{task_id}", status_code=200)
-def delete_task(task_id: int, db: Session = Depends(get_db)):
-    try:
-        task = db.query(Task).filter(Task.id == task_id).first()
-        if not task:
-            raise TaskNotFoundError(task_id)
-        
-        db.delete(task)
-        db.commit()
-        
-        logger.info(f"Task with ID {task_id} deleted successfully")
-        return {
-            "success": True,
-            "message": f"Task with ID {task_id} deleted successfully."
-        }
-        
-    except TaskNotFoundError:
-        db.rollback()
-        raise
-    except SQLAlchemyError as e:
-        db.rollback()
-        logger.error(f"Database error while deleting task {task_id}: {str(e)}")
-        raise DatabaseError("task deletion")
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Unexpected error while deleting task {task_id}: {str(e)}")
-        raise
-
-
-# app/main.py
-import uvicorn
-from fastapi import FastAPI, Depends
-from sqlalchemy.orm import Session
-from app.config.settings import settings
-from app.database.database import Base, engine, get_db
-from app.routers import tasks
-from app.models.models import Task
-from app.exceptions.handlers import setup_exception_handlers
-import logging
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-
-# Create database tables
-try:
-    Base.metadata.create_all(bind=engine)
-    logging.info("Database tables created successfully")
-except Exception as e:
-    logging.error(f"Failed to create database tables: {str(e)}")
-    raise
-
-app = FastAPI(
-    title=settings.APP_NAME,
-    version=settings.API_VERSION,
-    debug=settings.DEBUG
-)
-
-# Setup exception handlers
-setup_exception_handlers(app)
-
-# Include router
-app.include_router(
-    tasks.router,
-    prefix=f"/api/{settings.API_VERSION}/tasks",
-    tags=["Tasks"]
-)
-
-@app.get("/health")
-def health_check():
-    return {
-        "success": True,
-        "status": "ok", 
-        "message": "FastAPI server is running",
-        "version": settings.API_VERSION
-    }
-
-@app.get("/")
-def get_all_tasks(db: Session = Depends(get_db)):
-    try:
-        tasks = db.query(Task).all()
-        return {
-            "success": True,
-            "data": tasks if tasks else [],
-            "message": "No tasks found. Add some using /docs or /tasks" if not tasks else "Tasks retrieved successfully"
-        }
-    except Exception as e:
-        logging.error(f"Error in root endpoint: {str(e)}")
-        return {
-            "success": False,
-            "error": "Failed to fetch tasks",
-            "data": []
-        }
-
-if __name__ == "__main__":
-    uvicorn.run(
-        app, 
-        host="0.0.0.0", 
-        port=8000,
-        log_level="info"
+    order_by: Literal["id", "upload_date_time"] = Field(
+        description="Field used for sorting",
+        default="id",
     )
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-import uvicorn
-from fastapi import FastAPI, Depends
-from sqlalchemy.orm import Session
-from app.config.settings import settings
-from app.database.database import Base, engine, get_db
-from app.routers.tasks import router as tasks_router
-from app.models.models import Task
-from app.exceptions.handlers import setup_exception_handlers
-
-# Create database tables
-Base.metadata.create_all(bind=engine)
-
-app = FastAPI(
-    title=settings.APP_NAME,
-    version=settings.API_VERSION,
-    description="A complete Task Management API with proper error handling and validation",
-    debug=settings.DEBUG
-)
-
-# Setup exception handlers
-setup_exception_handlers(app)
-
-# Include router
-app.include_router(
-    tasks_router,
-    prefix=f"/api/{settings.API_VERSION}/tasks",
-    tags=["Tasks"]
-)
-
-@app.get("/health")
-def health_check():
-    return {
-        "success": True,
-        "status": "ok", 
-        "message": "FastAPI server is running",
-        "version": settings.API_VERSION
-    }
-
-@app.get("/")
-def get_all_tasks(db: Session = Depends(get_db)):
-    try:
-        tasks = db.query(Task).all()
-        if not tasks:
-            return {
-                "success": True,
-                "message": "Welcome to Task Management API! No tasks found. Add some using the /docs endpoint.",
-                "docs_url": "/docs"
-            }
-        return {
-            "success": True,
-            "data": tasks,
-            "count": len(tasks)
-        }
-    except Exception:
-        return {
-            "success": False,
-            "error": "Failed to fetch tasks",
-            "data": []
-        }
-
-if __name__ == "__main__":
-    uvicorn.run(
-        "app.main:app", 
-        host="0.0.0.0", 
-        port=8000,
-        reload=settings.DEBUG
+    as_table: bool = Field(
+        description="Return data in tabular format",
+        default=False,
     )
 
-from fastapi import APIRouter, Depends, Query
-from sqlalchemy.orm import Session
-from sqlalchemy.exc import SQLAlchemyError, IntegrityError
-from app.database.database import get_db
-from app.schemas.schemas import TaskCreate, TaskUpdate, TaskResponse
-from app.models.models import Task
-from app.utils.enums import validate_status_transition, validate_status_value
-from app.exceptions.handlers import (
-    TaskNotFoundError, InvalidStatusTransitionError, 
-    InvalidStatusError, EmptyTitleError, DatabaseError
-)
-from typing import List, Optional
-
-router = APIRouter()
-
-def validate_task_update_data(update_data: TaskUpdate) -> None:
-    if update_data.title is not None:
-        if not update_data.title.strip():
-            raise EmptyTitleError()
-        if len(update_data.title.strip()) > 200:
-            raise InvalidStatusError(
-                "Title too long", 
-                ["Title must be less than 200 characters"]
-            )
-
-# CREATE Task
-@router.post('/', response_model=TaskResponse, status_code=201)
-def create_task(task_data: TaskCreate, db: Session = Depends(get_db)):
-    try:
-        task_dict = task_data.model_dump()
-        task = Task(**task_dict)
-        
-        db.add(task)
-        db.commit()
-        db.refresh(task)
-        return task
-        
-    except (EmptyTitleError, InvalidStatusError):
-        db.rollback()
-        raise
-    except IntegrityError:
-        db.rollback()
-        raise DatabaseError("task creation - possible duplicate or constraint violation")
-    except SQLAlchemyError:
-        db.rollback()
-        raise DatabaseError("task creation")
-    except Exception:
-        db.rollback()
-        raise
-
-# GET Tasks
-@router.get("/", response_model=List[TaskResponse])
-def get_tasks(
-    db: Session = Depends(get_db),
-    task_id: Optional[int] = Query(default=None, description='Optional Task ID to fetch a specific task'),
-    status: Optional[str] = Query(default=None, description='Filter by status'),
-    skip: int = Query(0, ge=0, description='Number of records to skip'),
-    limit: int = Query(100, ge=1, le=1000, description='Number of records to return')
-):
-    try:
-        if status:
-            validate_status_value(status)
-        
-        if task_id:
-            task = db.query(Task).filter(Task.id == task_id).first()
-            if not task:
-                raise TaskNotFoundError(task_id)
-            return [task]
-        
-        query = db.query(Task)
-        if status:
-            status_enum = validate_status_value(status)
-            query = query.filter(Task.status == status_enum)
-        
-        tasks = query.order_by(Task.id).offset(skip).limit(limit).all()
-        
-        if not tasks and (task_id is not None or status is not None):
-            raise TaskNotFoundError(task_id if task_id else 0)
-            
-        return tasks
-        
-    except (TaskNotFoundError, InvalidStatusError):
-        raise
-    except SQLAlchemyError:
-        raise DatabaseError("fetching tasks")
-    except Exception:
-        raise
-
-# UPDATE Task
-@router.put("/{task_id}", response_model=TaskResponse)
-def update_task(task_id: int, update_data: TaskUpdate, db: Session = Depends(get_db)):
-    try:
-        task = db.query(Task).filter(Task.id == task_id).first()
-        if not task:
-            raise TaskNotFoundError(task_id)
-        
-        validate_task_update_data(update_data)
-        
-        if update_data.status is not None and update_data.status != task.status.value:
-            validate_status_transition(task.status.value, update_data.status)
-        
-        update_dict = update_data.model_dump(exclude_unset=True)
-        for key, value in update_dict.items():
-            setattr(task, key, value)
-        
-        db.commit()
-        db.refresh(task)
-        return task
-        
-    except (TaskNotFoundError, EmptyTitleError, InvalidStatusError, InvalidStatusTransitionError):
-        db.rollback()
-        raise
-    except IntegrityError:
-        db.rollback()
-        raise DatabaseError("task update - possible constraint violation")
-    except SQLAlchemyError:
-        db.rollback()
-        raise DatabaseError("task update")
-    except Exception:
-        db.rollback()
-        raise
-
-# DELETE Task
-@router.delete("/{task_id}", status_code=200)
-def delete_task(task_id: int, db: Session = Depends(get_db)):
-    try:
-        task = db.query(Task).filter(Task.id == task_id).first()
-        if not task:
-            raise TaskNotFoundError(task_id)
-        
-        db.delete(task)
-        db.commit()
+    @property
+    def sorting_keys(self):
         return {
-            "success": True,
-            "message": f"Task with ID {task_id} deleted successfully."
+            "id": database.Configuration.id,
+            "upload_datetime": database.Configuration.upload_datetime,
         }
-        
-    except TaskNotFoundError:
-        db.rollback()
-        raise
-    except SQLAlchemyError:
-        db.rollback()
-        raise DatabaseError("task deletion")
-    except Exception:
-        db.rollback()
-        raise
+
+    @property
+    def sorting_key(self):
+        return self.sorting_keys[self.order_by]
 
 
+class DQConfigDetails(BaseModel):
+    id: int = Field(
+        description="Configuration details",
+    )
 
+    file_name: str = Field(
+        description="Configuration file name (different from output file)",
+    )
 
+    status: str = Field(description="Status of most recent run for that configuration")
+    logs: str = Field(
+        description="URL pointing to log files",
+        default="#",
+    )
 
+    action: str = Field(
+        description="URL to toggle action (run/stop)",
+        default="#",
+    )
 
-from pydantic import BaseModel, Field, validator
-from typing import Optional
-from datetime import datetime
-from app.utils.enums import TaskStatus, validate_status_value
-from app.exceptions.handlers import InvalidStatusError, EmptyTitleError
+    job_history_id: Optional[int] = Field(
+        description="Job history id",
+        default=None,
+    )
 
-class TaskBase(BaseModel):
-    title: str = Field(..., min_length=1, max_length=200, description="Task title")
-    description: Optional[str] = Field(None, max_length=1000, description="Task description")
-    status: str = Field(default="not_started", description="Task status")
+    cosmos_uid: Optional[str] = Field(
+        description="Cosmos uuid",
+        default=None,
+    )
 
-    @validator('status')
-    def validate_status(cls, v):
-        if v is None:
-            return "not_started"
-        
-        try:
-            validate_status_value(v)
-            return v
-        except InvalidStatusError:
-            raise
+    log_uid: Optional[str] = Field(
+        description="Log uuid",
+        default=None,
+    )
 
-    @validator('title')
-    def validate_title(cls, v):
-        if not v or not v.strip():
-            raise EmptyTitleError()
-        return v.strip()
+    release_to_prod_id: Optional[int] = Field(
+        description="Release to prod id",
+        default=None,
+    )
 
-class TaskCreate(TaskBase):
-    pass
+    upload_datetime: datetime.datetime = Field(
+        description="Date of when configuration was uploaded",
+        default=None,
+    )
 
-class TaskUpdate(BaseModel):
-    title: Optional[str] = Field(None, min_length=1, max_length=200, description="Task title")
-    description: Optional[str] = Field(None, max_length=1000, description="Task description")
-    completed: Optional[bool] = Field(None, description="Whether task is completed")
-    status: Optional[str] = Field(None, description="Task status")
+    end_timestamp: Optional[datetime.datetime] = Field(
+        description="Last run's end timestamp",
+        default=None,
+    )
 
-    @validator('status')
-    def validate_status(cls, v):
-        if v is None:
-            return None
-        
-        try:
-            validate_status_value(v)
-            return v
-        except InvalidStatusError:
-            raise
+    result: Optional[PassFail] = Field(description="Config Result", default=None)
 
-    @validator('title')
-    def validate_title(cls, v):
-        if v is not None:
-            if not v.strip():
-                raise EmptyTitleError()
-            return v.strip()
-        return v
+    uploader_name: Optional[str] = Field(
+        description="Uploader Name", default="Anonymous"
+    )
 
-class TaskResponse(TaskBase):
-    id: int
-    completed: bool
-    created_at: datetime
-    updated_at: Optional[datetime] = None
+    has_batch: bool = Field(
+        description="Checks if batch exists for the config", default=False
+    )
 
-    class Config:
-        from_attributes = True
-
-
-
-
-
-
-from fastapi import FastAPI, Request, status
-from fastapi.responses import JSONResponse
-from fastapi.exceptions import RequestValidationError
-from sqlalchemy.exc import SQLAlchemyError, IntegrityError
-from typing import Any, Dict
-
-class CustomHTTPException(Exception):
-    def __init__(self, status_code: int, detail: str, headers: Dict[str, Any] = None):
-        self.status_code = status_code
-        self.detail = detail
-        self.headers = headers
-
-class TaskNotFoundError(CustomHTTPException):
-    def __init__(self, task_id: int):
-        super().__init__(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Task with ID {task_id} not found."
-        )
-
-class InvalidStatusTransitionError(CustomHTTPException):
-    def __init__(self, current_status: str, new_status: str):
-        super().__init__(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f'Invalid status transition. Cannot move backward from "{current_status}" to "{new_status}". Allowed workflow: not_started → pending → in_progress → completed'
-        )
-
-class InvalidStatusError(CustomHTTPException):
-    def __init__(self, status_value: str, allowed_values: list):
-        super().__init__(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid status '{status_value}'. Must be one of: {', '.join(allowed_values)}"
-        )
-
-class EmptyTitleError(CustomHTTPException):
-    def __init__(self):
-        super().__init__(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Title cannot be empty or contain only whitespace"
-        )
-
-class DatabaseError(CustomHTTPException):
-    def __init__(self, operation: str):
-        super().__init__(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database error during {operation}. Please try again later."
-        )
-
-def setup_exception_handlers(app: FastAPI):
+    modified_by: Optional[str] = Field(description="Modified By", default="Anonymous")
+    modified_at: Optional[datetime.datetime] = Field(
+        description="Modified At", default=None
+    )
     
-    @app.exception_handler(CustomHTTPException)
-    async def custom_http_exception_handler(request: Request, exc: CustomHTTPException):
-        return JSONResponse(
-            status_code=exc.status_code,
-            content={
-                "success": False,
-                "error": {
-                    "code": exc.__class__.__name__,
-                    "message": exc.detail,
-                    "path": request.url.path
-                }
-            },
-            headers=exc.headers
-        )
+    # SAFELY ADDED OPTIONAL FIELDS (will not break existing clients)
+    start_timestamp: Optional[datetime.datetime] = Field(
+        description="Job start timestamp from last run",
+        default=None
+    )
     
-    @app.exception_handler(InvalidStatusError)
-    async def invalid_status_handler(request: Request, exc: InvalidStatusError):
-        return JSONResponse(
-            status_code=exc.status_code,
-            content={
-                "success": False,
-                "error": {
-                    "code": "INVALID_STATUS",
-                    "message": exc.detail,
-                    "path": request.url.path
-                }
-            },
-            headers=exc.headers
-        )
-    
-    @app.exception_handler(RequestValidationError)
-    async def validation_exception_handler(request: Request, exc: RequestValidationError):
-        errors = []
-        for error in exc.errors():
-            field_path = " -> ".join(str(loc) for loc in error['loc'])
+    job_run_time: Optional[str] = Field(
+        description="Job run time in HH:MM:SS format",
+        default=None
+    )
+
+    @classmethod
+    def parse_orm(cls, orm_result: database.Configuration, session: Session) -> "DQConfigDetails":
+        has_ever_succeeded = False
+        release_to_prod_id = None
+
+        for status in orm_result.job_statuses:
+            if status.status == "SUCCESS":
+                has_ever_succeeded = True
+                break
+
+        if has_ever_succeeded:
+            job_history_id = orm_result.id
+        else:
+            job_history_id = None
+
+        cosmos_uid = None
+        log_uid = None
+        end_timestamp = None
+        result = None
+        status = "Not Started"
+        has_batch = False
+        
+        # NEW: Initialize optional timing fields
+        start_timestamp = None
+        job_run_time = None
+
+        for job in orm_result.jobs:
+            if job.batch:
+                has_batch = True
+                break
+
+        if orm_result.job_statuses:
+            last_job = sorted(
+                list(orm_result.job_statuses), key=lambda js: js.created_date
+            )[-1]
+            log_uid = last_job.name
+            status = READABLE_STATUSES.get(last_job.status, last_job.status)
             
-            if error['type'] == 'value_error':
-                if 'enum' in error.get('ctx', {}):
-                    errors.append({
-                        "field": field_path,
-                        "message": f"Invalid value. Must be one of: {', '.join(error['ctx']['expected'])}",
-                        "type": "invalid_choice"
-                    })
-                else:
-                    errors.append({
-                        "field": field_path,
-                        "message": error['msg'],
-                        "type": error['type']
-                    })
-            elif error['type'] == 'string_too_long':
-                errors.append({
-                    "field": field_path,
-                    "message": f"Value too long. Maximum length is {error['ctx']['max_length']} characters",
-                    "type": "length_exceeded"
-                })
-            elif error['type'] == 'string_too_short':
-                errors.append({
-                    "field": field_path,
-                    "message": f"Value too short. Minimum length is {error['ctx']['min_length']} characters",
-                    "type": "too_short"
-                })
-            elif error['type'] == 'missing':
-                errors.append({
-                    "field": field_path,
-                    "message": "This field is required",
-                    "type": "required_field"
-                })
+            # SAFELY get job timing information (handle missing attributes)
+            start_timestamp = getattr(last_job, 'start_timestamp', None)
+            end_timestamp = getattr(last_job, 'end_timestamp', None)
+            
+            # SAFELY calculate job run time if we have start_timestamp
+            if start_timestamp:
+                try:
+                    # Determine if job is completed
+                    completed_statuses = ['SUCCESS', 'FAILED', 'CANCELLED', 'COMPLETED']
+                    is_completed = last_job.status.upper() in completed_statuses
+                    
+                    # Calculate duration
+                    if is_completed and end_timestamp:
+                        # Job completed - use end_timestamp
+                        duration = end_timestamp - start_timestamp
+                    else:
+                        # Job is still running - calculate up to now
+                        duration = datetime.datetime.utcnow() - start_timestamp
+                    
+                    # Format as HH:MM:SS
+                    total_seconds = int(duration.total_seconds())
+                    hours = total_seconds // 3600
+                    minutes = (total_seconds % 3600) // 60
+                    seconds = total_seconds % 60
+                    job_run_time = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+                    
+                except (AttributeError, TypeError, ValueError):
+                    # Gracefully handle any calculation errors
+                    job_run_time = None
+
+            if last_job.status == "SUCCESS":
+                cosmos_uid = last_job.name
+                end_timestamp = getattr(last_job, 'end_timestamp', None)
+                # Get execution result for completed jobs
+                try:
+                    result = get_execution_result(last_job.results_and_breaches)
+                except (AttributeError, TypeError):
+                    result = None
+        else:
+            if not orm_result.released_to_prod:
+                release_to_prod_id = orm_result.id
             else:
-                errors.append({
-                    "field": field_path,
-                    "message": error['msg'],
-                    "type": error['type']
-                })
-        
-        return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            content={
-                "success": False,
-                "error": {
-                    "code": "VALIDATION_ERROR",
-                    "message": "Please check your input data",
-                    "details": errors
-                }
-            }
-        )
-    
-    @app.exception_handler(SQLAlchemyError)
-    async def sqlalchemy_exception_handler(request: Request, exc: SQLAlchemyError):
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={
-                "success": False,
-                "error": {
-                    "code": "DATABASE_ERROR",
-                    "message": "A database error occurred",
-                    "path": request.url.path
-                }
-            }
-        )
-    
-    @app.exception_handler(IntegrityError)
-    async def integrity_error_handler(request: Request, exc: IntegrityError):
-        return JSONResponse(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            content={
-                "success": False,
-                "error": {
-                    "code": "INTEGRITY_ERROR",
-                    "message": "Data integrity violation",
-                    "path": request.url.path
-                }
-            }
-        )
-    
-    @app.exception_handler(Exception)
-    async def general_exception_handler(request: Request, exc: Exception):
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={
-                "success": False,
-                "error": {
-                    "code": "INTERNAL_SERVER_ERROR",
-                    "message": "An unexpected error occurred",
-                    "path": request.url.path
-                }
-            }
-        )
-
-
-
-
-
-from enum import Enum
-from typing import List
-from app.exceptions.handlers import InvalidStatusTransitionError, InvalidStatusError
-
-class TaskStatus(str, Enum):
-    NOT_STARTED = "not_started"
-    PENDING = "pending"
-    IN_PROGRESS = "in_progress"
-    COMPLETED = "completed"
-
-STATUS_WORKFLOW: List[TaskStatus] = [
-    TaskStatus.NOT_STARTED,
-    TaskStatus.PENDING,
-    TaskStatus.IN_PROGRESS,
-    TaskStatus.COMPLETED
-]
-
-def validate_status_value(status_value: str) -> TaskStatus:
-    try:
-        return TaskStatus(status_value)
-    except ValueError:
-        valid_values = [status.value for status in TaskStatus]
-        raise InvalidStatusError(status_value, valid_values)
-
-def validate_status_transition(current_status: str, new_status: str) -> None:
-    current_enum = validate_status_value(current_status)
-    new_enum = validate_status_value(new_status)
-    
-    current_index = STATUS_WORKFLOW.index(current_enum)
-    new_index = STATUS_WORKFLOW.index(new_enum)
-    
-    if new_index < current_index:
-        raise InvalidStatusTransitionError(current_status, new_status)
-
-
-
-
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, Enum, CheckConstraint
-from sqlalchemy.sql import func
-from app.database.database import Base
-from app.utils.enums import TaskStatus
-
-class Task(Base):
-    __tablename__ = "tasks"
-
-    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    title = Column(String(200), index=True, nullable=False)
-    description = Column(String(1000), nullable=True)
-    completed = Column(Boolean, default=False)
-    status = Column(Enum(TaskStatus), default=TaskStatus.NOT_STARTED, nullable=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
-
-    __table_args__ = (
-        CheckConstraint(
-            "length(trim(title)) > 0",
-            name='non_empty_title_check'
-        ),
-    )
-
-
-
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy.exc import SQLAlchemyError
-from app.config.settings import settings
-from app.exceptions.handlers import DatabaseError
-
-SQLALCHEMY_DATABASE_URL = settings.DATABASE_URL
-
-engine = create_engine(
-    SQLALCHEMY_DATABASE_URL, 
-    connect_args={"check_same_thread": False}
-)
-
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-        db.commit()
-    except SQLAlchemyError as e:
-        db.rollback()
-        raise DatabaseError("database operation")
-    except Exception as e:
-        db.rollback()
-        raise
-    finally:
-        db.close()
-
-
-
-
-
-
-
-
-
-
-
--------_---------------
-from fastapi import FastAPI, Request, status
-from fastapi.responses import JSONResponse
-from fastapi.exceptions import RequestValidationError
-from sqlalchemy.exc import SQLAlchemyError, IntegrityError
-from typing import Any, Dict
-
-class CustomHTTPException(Exception):
-    def __init__(self, status_code: int, detail: str, headers: Dict[str, Any] = None):
-        self.status_code = status_code
-        self.detail = detail
-        self.headers = headers
-
-class TaskNotFoundError(CustomHTTPException):
-    def __init__(self, task_id: int):
-        super().__init__(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Task with ID {task_id} not found."
-        )
-
-class InvalidStatusTransitionError(CustomHTTPException):
-    def __init__(self, current_status: str, new_status: str):
-        super().__init__(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f'Invalid status transition. Cannot move backward from "{current_status}" to "{new_status}"'
-        )
-
-class InvalidStatusError(CustomHTTPException):
-    def __init__(self, status_value: str, allowed_values: list):
-        super().__init__(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid status value '{status_value}'. Allowed values are: {', '.join(allowed_values)}"
-        )
-
-class EmptyTitleError(CustomHTTPException):
-    def __init__(self):
-        super().__init__(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Title cannot be empty or contain only whitespace"
-        )
-
-class DatabaseError(CustomHTTPException):
-    def __init__(self, operation: str):
-        super().__init__(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database error during {operation}. Please try again later."
-        )
-
-def setup_exception_handlers(app: FastAPI):
-    
-    @app.exception_handler(CustomHTTPException)
-    async def custom_http_exception_handler(request: Request, exc: CustomHTTPException):
-        return JSONResponse(
-            status_code=exc.status_code,
-            content={
-                "success": False,
-                "error": {
-                    "code": exc.__class__.__name__,
-                    "message": exc.detail,
-                    "path": request.url.path
-                }
-            },
-            headers=exc.headers
-        )
-    
-    @app.exception_handler(RequestValidationError)
-    async def validation_exception_handler(request: Request, exc: RequestValidationError):
-        errors = []
-        for error in exc.errors():
-            errors.append({
-                "field": " -> ".join(str(loc) for loc in error['loc']),
-                "message": error['msg'],
-                "type": error['type']
-            })
-        
-        return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            content={
-                "success": False,
-                "error": {
-                    "code": "VALIDATION_ERROR",
-                    "message": "Request validation failed",
-                    "details": errors
-                }
-            }
-        )
-    
-    @app.exception_handler(SQLAlchemyError)
-    async def sqlalchemy_exception_handler(request: Request, exc: SQLAlchemyError):
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={
-                "success": False,
-                "error": {
-                    "code": "DATABASE_ERROR",
-                    "message": "A database error occurred",
-                    "path": request.url.path
-                }
-            }
-        )
-    
-    @app.exception_handler(IntegrityError)
-    async def integrity_error_handler(request: Request, exc: IntegrityError):
-        return JSONResponse(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            content={
-                "success": False,
-                "error": {
-                    "code": "INTEGRITY_ERROR",
-                    "message": "Data integrity violation",
-                    "path": request.url.path
-                }
-            }
-        )
-    
-    @app.exception_handler(Exception)
-    async def general_exception_handler(request: Request, exc: Exception):
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={
-                "success": False,
-                "error": {
-                    "code": "INTERNAL_SERVER_ERROR",
-                    "message": "An unexpected error occurred",
-                    "path": request.url.path
-                }
-            }
-        )
-
-
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy.exc import SQLAlchemyError
-from app.config.settings import settings
-from app.exceptions.handlers import DatabaseError
-
-SQLALCHEMY_DATABASE_URL = settings.DATABASE_URL
-
-engine = create_engine(
-    SQLALCHEMY_DATABASE_URL, 
-    connect_args={"check_same_thread": False}
-)
-
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-        db.commit()
-    except SQLAlchemyError as e:
-        db.rollback()
-        raise DatabaseError("database operation")
-    except Exception as e:
-        db.rollback()
-        raise
-    finally:
-        db.close()
-
-
-
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, CheckConstraint
-from sqlalchemy.sql import func
-from app.database.database import Base
-
-class Task(Base):
-    __tablename__ = "tasks"
-
-    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    title = Column(String(200), index=True, nullable=False)
-    description = Column(String(1000), nullable=True)
-    completed = Column(Boolean, default=False)
-    status = Column(String(20), default="pending", nullable=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
-
-    __table_args__ = (
-        CheckConstraint(
-            "status IN ('not_started', 'pending', 'in_progress', 'completed')",
-            name='valid_status_check'
-        ),
-        CheckConstraint(
-            "length(trim(title)) > 0",
-            name='non_empty_title_check'
-        ),
-    )
-
-
-from fastapi import APIRouter, Depends, Query
-from sqlalchemy.orm import Session
-from sqlalchemy.exc import SQLAlchemyError, IntegrityError
-from app.database.database import get_db
-from app.schemas.schemas import TaskCreate, TaskUpdate, TaskOut
-from app.models.models import Task
-from app.exceptions.handlers import (
-    TaskNotFoundError, InvalidStatusTransitionError, 
-    InvalidStatusError, EmptyTitleError, DatabaseError
-)
-from typing import List, Optional
-
-router = APIRouter()
-
-STATUS_FLOW = ["not_started", "pending", "in_progress", "completed"]
-
-def validate_task_data(task_data: TaskCreate) -> None:
-    if not task_data.title or not task_data.title.strip():
-        raise EmptyTitleError()
-    
-    if len(task_data.title.strip()) > 200:
-        raise InvalidStatusError(
-            "Title too long", 
-            ["Title must be less than 200 characters"]
-        )
-    
-    if task_data.status and task_data.status not in STATUS_FLOW:
-        raise InvalidStatusError(task_data.status, STATUS_FLOW)
-
-def validate_status_transition(current_status: str, new_status: str) -> None:
-    if new_status not in STATUS_FLOW:
-        raise InvalidStatusError(new_status, STATUS_FLOW)
-    
-    current_index = STATUS_FLOW.index(current_status)
-    new_index = STATUS_FLOW.index(new_status)
-    
-    if new_index < current_index:
-        raise InvalidStatusTransitionError(current_status, new_status)
-
-# CREATE Task
-@router.post('/', response_model=TaskOut, status_code=201)
-def create_task(task_data: TaskCreate, db: Session = Depends(get_db)):
-    try:
-        validate_task_data(task_data)
-        
-        task = Task(**task_data.model_dump())
-        db.add(task)
-        db.commit()
-        db.refresh(task)
-        return task
-        
-    except (EmptyTitleError, InvalidStatusError):
-        db.rollback()
-        raise
-    except IntegrityError:
-        db.rollback()
-        raise DatabaseError("task creation - possible duplicate or constraint violation")
-    except SQLAlchemyError:
-        db.rollback()
-        raise DatabaseError("task creation")
-    except Exception:
-        db.rollback()
-        raise
-
-# GET Tasks
-@router.get("/", response_model=List[TaskOut])
-def get_tasks(
-    db: Session = Depends(get_db),
-    task_id: Optional[int] = Query(default=None, description='Optional Task ID to fetch a specific task'),
-    status: Optional[str] = Query(default=None, description='Filter by status'),
-    skip: int = Query(0, ge=0, description='Number of records to skip'),
-    limit: int = Query(100, ge=1, le=1000, description='Number of records to return')
-):
-    try:
-        if status and status not in STATUS_FLOW:
-            raise InvalidStatusError(status, STATUS_FLOW)
-        
-        if task_id:
-            task = db.query(Task).filter(Task.id == task_id).first()
-            if not task:
-                raise TaskNotFoundError(task_id)
-            return [task]
-        
-        query = db.query(Task)
-        if status:
-            query = query.filter(Task.status == status)
-        
-        tasks = query.order_by(Task.id).offset(skip).limit(limit).all()
-        
-        if not tasks and (task_id is not None or status is not None):
-            raise TaskNotFoundError(task_id if task_id else 0)
-            
-        return tasks
-        
-    except (TaskNotFoundError, InvalidStatusError):
-        raise
-    except SQLAlchemyError:
-        raise DatabaseError("fetching tasks")
-    except Exception:
-        raise
-
-# UPDATE Task
-@router.put("/{task_id}", response_model=TaskOut)
-def update_task(task_id: int, update_data: TaskUpdate, db: Session = Depends(get_db)):
-    try:
-        task = db.query(Task).filter(Task.id == task_id).first()
-        if not task:
-            raise TaskNotFoundError(task_id)
-        
-        if update_data.title is not None:
-            if not update_data.title.strip():
-                raise EmptyTitleError()
-            if len(update_data.title.strip()) > 200:
-                raise InvalidStatusError(
-                    "Title too long", 
-                    ["Title must be less than 200 characters"]
-                )
-        
-        if update_data.status is not None and update_data.status != task.status:
-            validate_status_transition(task.status, update_data.status)
-        
-        update_dict = update_data.model_dump(exclude_unset=True)
-        for key, value in update_dict.items():
-            setattr(task, key, value)
-        
-        db.commit()
-        db.refresh(task)
-        return task
-        
-    except (TaskNotFoundError, EmptyTitleError, InvalidStatusError, InvalidStatusTransitionError):
-        db.rollback()
-        raise
-    except IntegrityError:
-        db.rollback()
-        raise DatabaseError("task update - possible constraint violation")
-    except SQLAlchemyError:
-        db.rollback()
-        raise DatabaseError("task update")
-    except Exception:
-        db.rollback()
-        raise
-
-# DELETE Task
-@router.delete("/{task_id}", status_code=200)
-def delete_task(task_id: int, db: Session = Depends(get_db)):
-    try:
-        task = db.query(Task).filter(Task.id == task_id).first()
-        if not task:
-            raise TaskNotFoundError(task_id)
-        
-        db.delete(task)
-        db.commit()
-        return {
-            "success": True,
-            "message": f"Task with ID {task_id} deleted successfully."
-        }
-        
-    except TaskNotFoundError:
-        db.rollback()
-        raise
-    except SQLAlchemyError:
-        db.rollback()
-        raise DatabaseError("task deletion")
-    except Exception:
-        db.rollback()
-        raise
-
-
-import uvicorn
-from fastapi import FastAPI, Depends
-from sqlalchemy.orm import Session
-from app.config.settings import settings
-from app.database.database import Base, engine, get_db
-from app.routers import tasks
-from app.models.models import Task
-from app.exceptions.handlers import setup_exception_handlers
-
-# Create database tables
-Base.metadata.create_all(bind=engine)
-
-app = FastAPI(
-    title=settings.APP_NAME,
-    version=settings.API_VERSION,
-    debug=settings.DEBUG
-)
-
-# Setup exception handlers
-setup_exception_handlers(app)
-
-# Include router
-app.include_router(
-    tasks.router,
-    prefix=f"/api/{settings.API_VERSION}/tasks",
-    tags=["Tasks"]
-)
-
-@app.get("/health")
-def health_check():
-    return {
-        "success": True,
-        "status": "ok", 
-        "message": "FastAPI server is running",
-        "version": settings.API_VERSION
-    }
-
-@app.get("/")
-def get_all_tasks(db: Session = Depends(get_db)):
-    try:
-        tasks = db.query(Task).all()
-        return {
-            "success": True,
-            "data": tasks if tasks else [],
-            "message": "No tasks found. Add some using /docs or /tasks" if not tasks else "Tasks retrieved successfully"
-        }
-    except Exception:
-        return {
-            "success": False,
-            "error": "Failed to fetch tasks",
-            "data": []
-        }
-
-if __name__ == "__main__":
-    uvicorn.run(
-        app, 
-        host="0.0.0.0", 
-        port=8000
-    )
-
-
-from pydantic import BaseModel, Field, validator
-from typing import Optional
-from datetime import datetime
-from app.utils.enums import TaskStatus
-from app.exceptions.handlers import InvalidStatusError, EmptyTitleError
-
-class TaskBase(BaseModel):
-    title: str = Field(..., min_length=1, max_length=200)
-    description: Optional[str] = Field(None, max_length=1000)
-    status: str = Field(default="not_started")
-
-    @validator('status')
-    def validate_status(cls, v):
-        if v is None:
-            return "not_started"
-        
-        if v not in ["not_started", "pending", "in_progress", "completed"]:
-            raise InvalidStatusError(v, ["not_started", "pending", "in_progress", "completed"])
-        return v
-
-    @validator('title')
-    def validate_title(cls, v):
-        if not v or not v.strip():
-            raise EmptyTitleError()
-        return v.strip()
-
-class TaskCreate(TaskBase):
-    pass
-
-class TaskUpdate(BaseModel):
-    title: Optional[str] = Field(None, min_length=1, max_length=200)
-    description: Optional[str] = Field(None, max_length=1000)
-    completed: Optional[bool] = None
-    status: Optional[str] = None
-
-    @validator('status')
-    def validate_status(cls, v):
-        if v is not None and v not in ["not_started", "pending", "in_progress", "completed"]:
-            raise InvalidStatusError(v, ["not_started", "pending", "in_progress", "completed"])
-        return v
-
-    @validator('title')
-    def validate_title(cls, v):
-        if v is not None:
-            if not v.strip():
-                raise EmptyTitleError()
-            return v.strip()
-        return v
-
-class TaskOut(TaskBase):
-    id: int
-    completed: bool
-    created_at: datetime
-    updated_at: Optional[datetime] = None
-
-    class Config:
-        from_attributes = True
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-without logging and using wnum ------
-from enum import Enum
-from typing import List
-from app.exceptions.handlers import InvalidStatusError, InvalidStatusTransitionError
-
-class TaskStatus(str, Enum):
-    NOT_STARTED = "not_started"
-    PENDING = "pending"
-    IN_PROGRESS = "in_progress"
-    COMPLETED = "completed"
-
-STATUS_WORKFLOW: List[TaskStatus] = [
-    TaskStatus.NOT_STARTED,
-    TaskStatus.PENDING,
-    TaskStatus.IN_PROGRESS,
-    TaskStatus.COMPLETED
-]
-
-def validate_status_value(status_value: str) -> TaskStatus:
-    try:
-        return TaskStatus(status_value)
-    except ValueError:
-        valid_values = [status.value for status in TaskStatus]
-        raise InvalidStatusError(status_value, valid_values)
-
-def validate_status_transition(current_status: str, new_status: str) -> None:
-    current_enum = validate_status_value(current_status)
-    new_enum = validate_status_value(new_status)
-    
-    current_index = STATUS_WORKFLOW.index(current_enum)
-    new_index = STATUS_WORKFLOW.index(new_enum)
-    
-    if new_index < current_index:
-        raise InvalidStatusTransitionError(current_status, new_status)
-
-
-from fastapi import APIRouter, Depends, Query
-from sqlalchemy.orm import Session
-from sqlalchemy.exc import SQLAlchemyError, IntegrityError
-from app.database.database import get_db
-from app.schemas.schemas import TaskCreate, TaskUpdate, TaskOut
-from app.models.models import Task
-from app.utils.enums import TaskStatus, STATUS_WORKFLOW, validate_status_value, validate_status_transition
-from app.exceptions.handlers import (
-    TaskNotFoundError, InvalidStatusTransitionError, 
-    InvalidStatusError, EmptyTitleError, DatabaseError
-)
-from typing import List, Optional
-
-router = APIRouter()
-
-def validate_task_data(task_data: TaskCreate) -> None:
-    if not task_data.title or not task_data.title.strip():
-        raise EmptyTitleError()
-    
-    if len(task_data.title.strip()) > 200:
-        raise InvalidStatusError(
-            "Title too long", 
-            ["Title must be less than 200 characters"]
-        )
-    
-    # Status validation is handled by Pydantic validator with custom error
-
-def validate_status_transition(current_status: str, new_status: str) -> None:
-    # Convert strings to enums for workflow validation
-    current_enum = validate_status_value(current_status)
-    new_enum = validate_status_value(new_status)
-    
-    current_index = STATUS_WORKFLOW.index(current_enum)
-    new_index = STATUS_WORKFLOW.index(new_enum)
-    
-    if new_index < current_index:
-        raise InvalidStatusTransitionError(current_status, new_status)
-
-# CREATE Task
-@router.post('/', response_model=TaskOut, status_code=201)
-def create_task(task_data: TaskCreate, db: Session = Depends(get_db)):
-    try:
-        validate_task_data(task_data)
-        
-        task = Task(**task_data.model_dump())
-        db.add(task)
-        db.commit()
-        db.refresh(task)
-        return task
-        
-    except (EmptyTitleError, InvalidStatusError):
-        db.rollback()
-        raise
-    except IntegrityError:
-        db.rollback()
-        raise DatabaseError("task creation - possible duplicate or constraint violation")
-    except SQLAlchemyError:
-        db.rollback()
-        raise DatabaseError("task creation")
-    except Exception:
-        db.rollback()
-        raise
-
-# GET Tasks
-@router.get("/", response_model=List[TaskOut])
-def get_tasks(
-    db: Session = Depends(get_db),
-    task_id: Optional[int] = Query(default=None, description='Optional Task ID to fetch a specific task'),
-    status: Optional[str] = Query(default=None, description='Filter by status'),
-    skip: int = Query(0, ge=0, description='Number of records to skip'),
-    limit: int = Query(100, ge=1, le=1000, description='Number of records to return')
-):
-    try:
-        # Validate status filter using our custom validation
-        if status:
-            validate_status_value(status)
-        
-        if task_id:
-            task = db.query(Task).filter(Task.id == task_id).first()
-            if not task:
-                raise TaskNotFoundError(task_id)
-            return [task]
-        
-        query = db.query(Task)
-        if status:
-            query = query.filter(Task.status == status)
-        
-        tasks = query.order_by(Task.id).offset(skip).limit(limit).all()
-        
-        if not tasks and (task_id is not None or status is not None):
-            raise TaskNotFoundError(task_id if task_id else 0)
-            
-        return tasks
-        
-    except (TaskNotFoundError, InvalidStatusError):
-        raise
-    except SQLAlchemyError:
-        raise DatabaseError("fetching tasks")
-    except Exception:
-        raise
-
-# UPDATE Task
-@router.put("/{task_id}", response_model=TaskOut)
-def update_task(task_id: int, update_data: TaskUpdate, db: Session = Depends(get_db)):
-    try:
-        task = db.query(Task).filter(Task.id == task_id).first()
-        if not task:
-            raise TaskNotFoundError(task_id)
-        
-        if update_data.title is not None:
-            if not update_data.title.strip():
-                raise EmptyTitleError()
-            if len(update_data.title.strip()) > 200:
-                raise InvalidStatusError(
-                    "Title too long", 
-                    ["Title must be less than 200 characters"]
-                )
-        
-        if update_data.status is not None and update_data.status != task.status:
-            validate_status_transition(task.status, update_data.status)
-        
-        update_dict = update_data.model_dump(exclude_unset=True)
-        for key, value in update_dict.items():
-            setattr(task, key, value)
-        
-        db.commit()
-        db.refresh(task)
-        return task
-        
-    except (TaskNotFoundError, EmptyTitleError, InvalidStatusError, InvalidStatusTransitionError):
-        db.rollback()
-        raise
-    except IntegrityError:
-        db.rollback()
-        raise DatabaseError("task update - possible constraint violation")
-    except SQLAlchemyError:
-        db.rollback()
-        raise DatabaseError("task update")
-    except Exception:
-        db.rollback()
-        raise
-
-# DELETE Task
-@router.delete("/{task_id}", status_code=200)
-def delete_task(task_id: int, db: Session = Depends(get_db)):
-    try:
-        task = db.query(Task).filter(Task.id == task_id).first()
-        if not task:
-            raise TaskNotFoundError(task_id)
-        
-        db.delete(task)
-        db.commit()
-        return {
-            "success": True,
-            "message": f"Task with ID {task_id} deleted successfully."
-        }
-        
-    except TaskNotFoundError:
-        db.rollback()
-        raise
-    except SQLAlchemyError:
-        db.rollback()
-        raise DatabaseError("task deletion")
-    except Exception:
-        db.rollback()
-        raise
-
-
-
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, CheckConstraint
-from sqlalchemy.sql import func
-from app.database.database import Base
-from app.utils.enums import TaskStatus
-
-class Task(Base):
-    __tablename__ = "tasks"
-
-    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    title = Column(String(200), index=True, nullable=False)
-    description = Column(String(1000), nullable=True)
-    completed = Column(Boolean, default=False)
-    status = Column(String(20), default=TaskStatus.NOT_STARTED.value, nullable=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
-
-    __table_args__ = (
-        CheckConstraint(
-            f"status IN ('{TaskStatus.NOT_STARTED.value}', '{TaskStatus.PENDING.value}', '{TaskStatus.IN_PROGRESS.value}', '{TaskStatus.COMPLETED.value}')",
-            name='valid_status_check'
-        ),
-        CheckConstraint(
-            "length(trim(title)) > 0",
-            name='non_empty_title_check'
-        ),
-    )
-
-
-from pydantic import BaseModel, Field, validator
-from typing import Optional
-from datetime import datetime
-from app.utils.enums import TaskStatus, validate_status_value
-from app.exceptions.handlers import InvalidStatusError, EmptyTitleError
-
-class TaskBase(BaseModel):
-    title: str = Field(..., min_length=1, max_length=200)
-    description: Optional[str] = Field(None, max_length=1000)
-    status: str = Field(default="not_started")
-
-    @validator('status')
-    def validate_status(cls, v):
-        if v is None:
-            return TaskStatus.NOT_STARTED.value
-        
-        # Use our custom validation with custom error messages
+                successful_jobs = [
+                    j for j in orm_result.job_statuses if j.status == "SUCCESS"
+                ]
+                if successful_jobs:
+                    latest_success = sorted(
+                        list(successful_jobs), key=lambda js: js.created_date
+                    )[-1]
+                    end_timestamp = getattr(latest_success, 'end_timestamp', None)
+                    
+                    # SAFELY get timing for successful jobs
+                    start_timestamp = getattr(latest_success, 'start_timestamp', None)
+                    if start_timestamp and end_timestamp:
+                        try:
+                            duration = end_timestamp - start_timestamp
+                            total_seconds = int(duration.total_seconds())
+                            hours = total_seconds // 3600
+                            minutes = (total_seconds % 3600) // 60
+                            seconds = total_seconds % 60
+                            job_run_time = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+                        except (AttributeError, TypeError, ValueError):
+                            job_run_time = None
+
+        # Get modified details
         try:
-            validate_status_value(v)
-            return v
-        except InvalidStatusError:
-            # Re-raise to maintain custom error message
-            raise
-
-    @validator('title')
-    def validate_title(cls, v):
-        if not v or not v.strip():
-            raise EmptyTitleError()
-        return v.strip()
-
-class TaskCreate(TaskBase):
-    pass
-
-class TaskUpdate(BaseModel):
-    title: Optional[str] = Field(None, min_length=1, max_length=200)
-    description: Optional[str] = Field(None, max_length=1000)
-    completed: Optional[bool] = None
-    status: Optional[str] = None
-
-    @validator('status')
-    def validate_status(cls, v):
-        if v is None:
-            return None
+            modified_details = cls.get_modified_by_config_id(cls, session, orm_result.id)
+        except Exception:
+            modified_details = {"modified_by": "Anonymous", "modified_at": None}
         
-        try:
-            validate_status_value(v)
-            return v
-        except InvalidStatusError:
-            raise
+        # Prepare result dictionary
+        orm_result_dict = {
+            "id": orm_result.id,
+            "file_name": orm_result.file_name,
+        }
 
-    @validator('title')
-    def validate_title(cls, v):
-        if v is not None:
-            if not v.strip():
-                raise EmptyTitleError()
-            return v.strip()
-        return v
+        return cls(
+            cosmos_uid=cosmos_uid,
+            log_uid=log_uid,
+            job_history_id=job_history_id,
+            status=status,
+            release_to_prod_id=release_to_prod_id,
+            end_timestamp=end_timestamp,
+            result=result,
+            uploader_name=orm_result.uploader_name,
+            modified_by=orm_result.uploader_name
+            if str(modified_details.get("modified_by", "Anonymous")).lower() == "anonymous"
+            else modified_details.get("modified_by", "Anonymous"),
+            modified_at=orm_result.upload_datetime
+            if not modified_details.get("modified_at")
+            else modified_details.get("modified_at"),
+            has_batch=has_batch,
+            # SAFELY ADDED OPTIONAL FIELDS
+            start_timestamp=start_timestamp,
+            job_run_time=job_run_time,
+            **orm_result_dict
+        )
 
-class TaskOut(TaskBase):
+    @classmethod
+    def load_by_name(cls, session: Session, file_name: str, team_id: int) -> "DQConfigDetails":
+        result = (
+            session.query(
+                database.Configuration,
+            )
+            .where(
+                database.Configuration.active,
+                database.Configuration.file_name == file_name,
+                database.Configuration.team_id == team_id,
+            )
+            .order_by(
+                database.Configuration.upload_datetime.desc(),
+            )
+            .options(joinedload(database.Configuration.job_statuses))
+            .first()
+        )
+
+        if result:
+            return cls.parse_orm(result, session)
+        else:
+            raise DoesNotExistsException("Configuration not found")
+
+    def get_modified_by_config_id(self, session: Session, dq_config_id):
+        stmt = (
+            union_all(
+                select(
+                    database.Rule.modified_by.label("modified_by"),
+                    database.Rule.modified_at.label("modified_at"),
+                )
+                .join(database.Batch, database.Rule.batch_id == database.Batch.id)
+                .join(database.Job, database.Job.batch_id == database.Batch.id)
+                .where(
+                    database.Job.configuration_id == dq_config_id,
+                    database.Job.actv_flag_ind == Active.Y,
+                    database.Batch.soft_delete == False,
+                    database.Rule.soft_delete.is_(None),
+                    database.Rule.modified_at.isnot(None),
+                ),
+                select(
+                    database.Batch.modified_by.label("modified_by"),
+                    database.Batch.modified_at.label("modified_at"),
+                )
+                .join(database.Job, database.Job.batch_id == database.Batch.id)
+                .where(
+                    database.Job.configuration_id == dq_config_id,
+                    database.Job.actv_flag_ind == Active.Y,
+                    database.Batch.soft_delete == False,
+                    database.Batch.modified_at.isnot(None),
+                ),
+            )
+            .order_by(text("modified_at DESC"))
+            .limit(1)
+        )
+        data = session.execute(stmt).first()
+        if data:
+            return {"modified_by": data.modified_by, "modified_at": data.modified_at}
+        return {"modified_by": "Anonymous", "modified_at": None}
+
+
+class DQConfigDetailsList(PaginatedModel):
+    data: List[DQConfigDetails]
+
+    @classmethod
+    def load(
+        cls, session: Session, filters: DQConfigDetailsFilters
+    ) -> Union["DQConfigDetailsList", Table]:
+        where_conditions = [
+            database.Configuration.team_id == filters.team_id,
+            database.Configuration.active,
+        ]
+
+        query = session.query(
+            database.Configuration,
+        ).where(
+            *where_conditions,
+        )
+
+        count = query.count()
+
+        results = (
+            query.order_by(
+                filters.sorting_key.desc(),
+            )
+            .offset(
+                filters.page_number * filters.items_per_page,
+            )
+            .limit(
+                filters.items_per_page,
+            )
+            .options(joinedload(database.Configuration.job_statuses))
+            .all()
+        )
+
+        entities = []
+
+        for result in results:
+            entities.append(DQConfigDetails.parse_orm(result, session))
+
+        if filters.as_table:
+            # Use original TABLE_MAPPING (without job_run_time) for backward compatibility
+            return Table.convert(
+                entities,
+                TABLE_MAPPING,
+                page_number=filters.page_number,
+                items_per_page=filters.items_per_page,
+                total_number_of_items=count,
+            )
+
+        return cls(
+            data=entities,
+            page_number=filters.page_number,
+            items_per_page=filters.items_per_page,
+            total_number_of_items=count,
+        )
+
+
+class ProfilingConfigDetails(BaseModel):
+    jobs: List[dict]
+    batches: List[dict]
+    rules: List[dict]
+    rule_logics: List[dict]
+    groupings: List[dict]
+    references: List[dict]
+    parameter_maps: List[dict]
+    team_id: int
+    file_name: str
+    profiling_id: int
+
+
+
+
+dq_config_api/models/profiling_list.py
+import datetime
+from typing import List, Optional, Any
+
+import sqlglot
+from sqlglot.errors import ParseError
+from pydantic import BaseModel, Field, model_validator
+
+from dq_config_api.database.profiling import ProfilingDatabaseType, ProfilingType
+
+
+def validate_base_population(data: Any):
+    try:
+        base_population = getattr(data, "base_pop", "")
+        if not base_population or len(base_population.split()) < 2:
+            raise ValueError("base_pop not a valid query provided")
+        database_type = str(data.database_type.value).replace(" ", "").lower()
+        sqlglot.parse_one(
+            base_population,
+            dialect="duckdb" if database_type == "file" else database_type,
+        )
+        return data
+    except ParseError as e:
+        raise ValueError(f"base_pop not a valid query. exception occurred : {e}")
+
+
+class CreateProfilingSchema(BaseModel):
+    team_id: int
+    base_pop_id: int
+    base_pop_desc: str = Field(min_length=1)
+    dataset_name: str = Field(min_length=1)
+    base_pop: str = Field(min_length=1)
+    database_type: ProfilingDatabaseType = Field(min_length=1)
+    table: str = Field(min_length=1)
+    eim_id: str = Field(min_length=1)
+    connection_string: str = Field(min_length=1)
+    profiling_type: ProfilingType = Field(min_length=1)
+    record_limit: int
+    auto_gen_batch: bool = Field(default=False)
+
+    @model_validator(mode="after")
+    @classmethod
+    def validate_query(cls, data: Any):
+        return validate_base_population(data)
+
+
+class UpdateProfiling(BaseModel):
+    base_pop_id: Optional[int] = Field(default=None)
+    base_pop_desc: Optional[str] = Field(min_length=1, default=None)
+    dataset_name: Optional[str] = Field(min_length=1, default=None)
+    base_pop: Optional[str] = Field(min_length=1, default=None)
+    database_type: Optional[ProfilingDatabaseType] = Field(min_length=1, default=None)
+    table: Optional[str] = Field(min_length=1, default=None)
+    eim_id: Optional[str] = Field(min_length=1, default=None)
+    connection_string: Optional[str] = Field(min_length=1, default=None)
+    profiling_type: Optional[ProfilingType] = Field(min_length=1, default=None)
+    record_limit: Optional[int] = Field(default=None)
+    auto_gen_batch: bool = Field(default=False)
+
+    @model_validator(mode="after")
+    @classmethod
+    def validate_query(cls, data: "UpdateProfiling"):
+        if data.base_pop is not None and data.database_type is None:
+            raise ValueError("database type is required when changing base_pop")
+        if data.database_type is not None and data.base_pop is None:
+            raise ValueError("base_pop is required when changing database_type")
+
+        if data.base_pop is not None:
+            return validate_base_population(data)
+
+        return data
+
+
+class GetProfiling(BaseModel):
     id: int
-    completed: bool
-    created_at: datetime
-    updated_at: Optional[datetime] = None
+    base_pop_id: int
+    base_pop_desc: str
+    dataset_name: str
+    base_pop: str
+    database_type: str
+    connection_string: str
+    table: str
+    eim_id: str
+    profiling_type: str
+    record_limit: int
 
-    class Config:
-        from_attributes = True
-
-
-
-from enum import Enum
-from typing import List
-from app.exceptions.handlers import InvalidStatusError
-
-class TaskStatus(str, Enum):
-    NOT_STARTED = "not_started"
-    PENDING = "pending"
-    IN_PROGRESS = "in_progress"
-    COMPLETED = "completed"
-
-STATUS_WORKFLOW: List[TaskStatus] = [
-    TaskStatus.NOT_STARTED,
-    TaskStatus.PENDING,
-    TaskStatus.IN_PROGRESS,
-    TaskStatus.COMPLETED
-]
-
-def validate_status_value(status_value: str) -> TaskStatus:
-    try:
-        return TaskStatus(status_value)
-    except ValueError:
-        valid_values = [status.value for status in TaskStatus]
-        raise InvalidStatusError(status_value, valid_values)
-
-
-
-
-
-import uvicorn
-from fastapi import FastAPI, Depends
-from sqlalchemy.orm import Session
-from app.config.settings import settings
-from app.database.database import Base, engine, get_db
-from app.routers.tasks import router as tasks_router
-from app.models.models import Task
-from app.exceptions.handlers import setup_exception_handlers
-
-# Create database tables
-Base.metadata.create_all(bind=engine)
-
-app = FastAPI(
-    title=settings.APP_NAME,
-    version=settings.API_VERSION,
-    description="Task Management API with Enum-based status validation",
-    debug=settings.DEBUG
-)
-
-# Setup exception handlers - IMPORTANT: This must be called
-setup_exception_handlers(app)
-
-# Include router
-app.include_router(
-    tasks_router,
-    prefix=f"/api/{settings.API_VERSION}/tasks",
-    tags=["Tasks"]
-)
-
-@app.get("/health")
-def health_check():
-    return {
-        "success": True,
-        "status": "ok", 
-        "message": "FastAPI server is running",
-        "version": settings.API_VERSION
-    }
-
-@app.get("/")
-def root():
-    return {
-        "message": "Welcome to Task Management API!",
-        "docs": "/docs",
-        "health": "/health",
-        "api_version": settings.API_VERSION
-    }
-
-@app.get("/debug")
-def debug_info(db: Session = Depends(get_db)):
-    """Debug endpoint to check database and enum setup"""
-    try:
-        task_count = db.query(Task).count()
-        return {
-            "success": True,
-            "database_status": "connected",
-            "total_tasks": task_count,
-            "available_statuses": ["not_started", "pending", "in_progress", "completed"]
-        }
-    except Exception:
-        return {
-            "success": False,
-            "database_status": "disconnected",
-            "error": "Cannot connect to database"
-        }
-
-if __name__ == "__main__":
-    uvicorn.run(
-        "app.main:app", 
-        host="0.0.0.0", 
-        port=8000,
-        reload=settings.DEBUG
+    status: str
+    sample_config_id: Optional[str]
+    report_id: Optional[str]
+    error: Optional[str] = None
+    is_running: bool
+    auto_gen_batch: Optional[bool] = False
+    
+    # SAFELY ADDED OPTIONAL FIELDS
+    start_timestamp: Optional[datetime.datetime] = Field(
+        description="Profiling job start timestamp",
+        default=None
+    )
+    
+    end_timestamp: Optional[datetime.datetime] = Field(
+        description="Profiling job end timestamp",
+        default=None
+    )
+    
+    job_run_time: Optional[str] = Field(
+        description="Profiling job run time in HH:MM:SS format",
+        default=None
     )
 
 
+class ProfilingList(BaseModel):
+    data: List[GetProfiling]
+
+
+class ProfilingStatus(BaseModel):
+    job_status: str
+    finished_at: datetime.datetime
+    error: Optional[str] = None
 
 
 
+dq_config_api/dependencies/profiling.py
+    def get_profiling_list(self, team_id: int) -> ProfilingList:
+        team = self.session.get(database.Team, team_id)
 
-from fastapi import FastAPI, Request, status
-from fastapi.responses import JSONResponse
-from fastapi.exceptions import RequestValidationError
-from sqlalchemy.exc import SQLAlchemyError, IntegrityError
-from typing import Any, Dict
-from pydantic import ValidationError
+        if not team:
+            raise DoesNotExistsException("Team not found")
 
-class CustomHTTPException(Exception):
-    def __init__(self, status_code: int, detail: str, headers: Dict[str, Any] = None):
-        self.status_code = status_code
-        self.detail = detail
-        self.headers = headers
+        if not self.team_manager.has_team_access(team_id):
+            raise NotAuthorizedException()
 
-class TaskNotFoundError(CustomHTTPException):
-    def __init__(self, task_id: int):
-        super().__init__(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Task with ID {task_id} not found."
-        )
+        profiling_configurations = []
 
-class InvalidStatusTransitionError(CustomHTTPException):
-    def __init__(self, current_status: str, new_status: str):
-        super().__init__(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f'Invalid status transition. Cannot move backward from "{current_status}" to "{new_status}". Allowed workflow: not_started → pending → in_progress → completed'
-        )
-
-class InvalidStatusError(CustomHTTPException):
-    def __init__(self, status_value: str, allowed_values: list):
-        super().__init__(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid status '{status_value}'. Must be one of: {', '.join(allowed_values)}"
-        )
-
-class EmptyTitleError(CustomHTTPException):
-    def __init__(self):
-        super().__init__(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Title cannot be empty or contain only whitespace"
-        )
-
-class DatabaseError(CustomHTTPException):
-    def __init__(self, operation: str):
-        super().__init__(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database error during {operation}. Please try again later."
-        )
-
-def setup_exception_handlers(app: FastAPI):
-    
-    @app.exception_handler(CustomHTTPException)
-    async def custom_http_exception_handler(request: Request, exc: CustomHTTPException):
-        return JSONResponse(
-            status_code=exc.status_code,
-            content={
-                "success": False,
-                "error": {
-                    "code": exc.__class__.__name__,
-                    "message": exc.detail,
-                    "path": request.url.path
-                }
-            },
-            headers=exc.headers
-        )
-    
-    @app.exception_handler(InvalidStatusError)
-    async def invalid_status_handler(request: Request, exc: InvalidStatusError):
-        return JSONResponse(
-            status_code=exc.status_code,
-            content={
-                "success": False,
-                "error": {
-                    "code": "INVALID_STATUS",
-                    "message": exc.detail,
-                    "path": request.url.path
-                }
-            },
-            headers=exc.headers
-        )
-    
-    @app.exception_handler(RequestValidationError)
-    async def validation_exception_handler(request: Request, exc: RequestValidationError):
-        """Custom validation error handler that shows our custom error messages"""
-        errors = []
-        for error in exc.errors():
-            field_path = " -> ".join(str(loc) for loc in error['loc'])
+        for profiling_configuration, is_running in (
+            self.session.query(database.Profiling, database.Profiling.is_running)
+            .where(
+                database.Profiling.team_id == team_id,
+                database.Profiling.deleted_at.is_(None),
+            )
+            .all()
+        ):
+            current_job = (
+                self.session.query(database.ProfilingJob)
+                .where(
+                    database.ProfilingJob.profiling_id == profiling_configuration.id,
+                )
+                .order_by(database.ProfilingJob.start_timestamp.desc())
+                .limit(1)
+                .one_or_none()
+            )
             
-            # Check if this is a custom error from our validators
-            if error['type'] == 'value_error' and 'ctx' in error:
-                # This might be our custom error, use the original message
-                if 'CustomHTTPException' in str(error.get('ctx', {})):
-                    # Extract our custom message
-                    errors.append({
-                        "field": field_path,
-                        "message": error['msg'],
-                        "type": "custom_validation"
-                    })
-                elif 'enum' in error.get('ctx', {}):
-                    errors.append({
-                        "field": field_path,
-                        "message": f"Invalid value. Must be one of: {', '.join(error['ctx']['expected'])}",
-                        "type": "invalid_choice"
-                    })
-                else:
-                    errors.append({
-                        "field": field_path,
-                        "message": error['msg'],
-                        "type": error['type']
-                    })
-            elif error['type'] == 'string_too_long':
-                errors.append({
-                    "field": field_path,
-                    "message": f"Value too long. Maximum length is {error['ctx']['max_length']} characters",
-                    "type": "length_exceeded"
-                })
-            elif error['type'] == 'string_too_short':
-                errors.append({
-                    "field": field_path,
-                    "message": f"Value too short. Minimum length is {error['ctx']['min_length']} characters",
-                    "type": "too_short"
-                })
-            elif error['type'] == 'missing':
-                errors.append({
-                    "field": field_path,
-                    "message": "This field is required",
-                    "type": "required_field"
-                })
+            # NEW: Calculate job timing information SAFELY
+            start_timestamp = None
+            end_timestamp = None
+            job_run_time = None  # Optional field
+            
+            if current_job:
+                # Use getattr for safety in case columns don't exist
+                start_timestamp = getattr(current_job, 'start_timestamp', None)
+                end_timestamp = getattr(current_job, 'end_timestamp', None)
+                
+                # Calculate job run time if we have start_timestamp
+                if start_timestamp:
+                    try:
+                        # Determine if job is completed
+                        completed_statuses = ['SUCCESS', 'FAILED', 'CANCELLED', 'COMPLETED']
+                        is_completed = current_job.status.upper() in completed_statuses
+                        
+                        # Calculate duration
+                        if is_completed and end_timestamp:
+                            duration = end_timestamp - start_timestamp
+                        else:
+                            duration = datetime.datetime.utcnow() - start_timestamp
+                        
+                        # Format as HH:MM:SS
+                        total_seconds = int(duration.total_seconds())
+                        hours = total_seconds // 3600
+                        minutes = (total_seconds % 3600) // 60
+                        seconds = total_seconds % 60
+                        job_run_time = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+                        
+                    except (AttributeError, TypeError, ValueError):
+                        # Gracefully handle any calculation errors
+                        job_run_time = None
+
+            if current_job is None:
+                job_info = {
+                    "status": "Not Started",
+                    "sample_config_id": None,
+                    "report_id": None,
+                    "error": None,
+                    "is_running": is_running,
+                }
+            elif current_job.status == "SUCCESS":
+                job_info = {
+                    "status": READABLE_STATUSES.get(
+                        current_job.status, current_job.status
+                    ),
+                    "sample_config_id": current_job.job_id,
+                    "report_id": current_job.job_id,
+                    "error": None,
+                    "is_running": is_running,
+                }
             else:
-                errors.append({
-                    "field": field_path,
-                    "message": error['msg'],
-                    "type": error['type']
-                })
+                job_info = {
+                    "status": READABLE_STATUSES.get(
+                        current_job.status, current_job.status
+                    ),
+                    "sample_config_id": None,
+                    "report_id": None,
+                    "error": current_job.error,
+                    "is_running": is_running,
+                }
+            
+            # Add timing fields to job_info
+            job_info["start_timestamp"] = start_timestamp
+            job_info["end_timestamp"] = end_timestamp
+            job_info["job_run_time"] = job_run_time
+
+            profiling_configurations.append(
+                GetProfiling(
+                    id=profiling_configuration.id,
+                    base_pop_id=profiling_configuration.base_pop_id,
+                    base_pop_desc=profiling_configuration.base_pop_desc,
+                    dataset_name=profiling_configuration.dataset_name,
+                    base_pop=profiling_configuration.base_pop,
+                    database_type=profiling_configuration.database_type,
+                    connection_string=profiling_configuration.connection_string,
+                    table=profiling_configuration.table,
+                    eim_id=profiling_configuration.eim_id,
+                    profiling_type=profiling_configuration.profiling_type,
+                    record_limit=profiling_configuration.record_limit,
+                    auto_gen_batch=profiling_configuration.auto_gen_batch,
+                    **job_info,
+                )
+            )
+
+        return ProfilingList(data=profiling_configurations)
+
+
+
+
+
+
+dq_config_api/models/job_status.py
+import datetime
+from typing import Optional, Literal
+
+from pydantic import BaseModel, Field
+
+from dq_config_api.db import DBSession
+from dq_config_api import database
+from dq_config_api.exceptions import DoesNotExistsException
+
+
+class JobStatus(BaseModel):
+    job_id: str
+    job_status: str
+    created_at: datetime.datetime
+    finished_at: Optional[datetime.datetime]
+    created_by: str
+    
+    # SAFELY ADDED OPTIONAL FIELDS
+    start_timestamp: Optional[datetime.datetime] = Field(default=None)
+    end_timestamp: Optional[datetime.datetime] = Field(default=None)
+    job_run_time: Optional[str] = Field(default=None)
+
+    @classmethod
+    def get_by_name(cls, session: DBSession, name: str):
+        job_status = (
+            session.query(database.DQMonitoringJob)
+            .where(database.DQMonitoringJob.name == name)
+            .first()
+        )
+        if not job_status:
+            raise DoesNotExistsException("Job not found")
+
+        # SAFELY get timing information
+        start_timestamp = getattr(job_status, 'start_timestamp', None)
+        end_timestamp = getattr(job_status, 'end_timestamp', None)
+        job_run_time = None
         
-        return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            content={
-                "success": False,
-                "error": {
-                    "code": "VALIDATION_ERROR",
-                    "message": "Please check your input data",
-                    "details": errors
-                }
-            }
+        # Calculate job run time if we have start_timestamp
+        if start_timestamp:
+            try:
+                # Determine if job is completed
+                completed_statuses = ['SUCCESS', 'FAILED', 'CANCELLED', 'COMPLETED']
+                is_completed = job_status.status.upper() in completed_statuses
+                
+                # Calculate duration
+                if is_completed and end_timestamp:
+                    duration = end_timestamp - start_timestamp
+                else:
+                    duration = datetime.datetime.utcnow() - start_timestamp
+                
+                # Format as HH:MM:SS
+                total_seconds = int(duration.total_seconds())
+                hours = total_seconds // 3600
+                minutes = (total_seconds % 3600) // 60
+                seconds = total_seconds % 60
+                job_run_time = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+                
+            except (AttributeError, TypeError, ValueError):
+                # Gracefully handle any calculation errors
+                job_run_time = None
+
+        return JobStatus(
+            job_id=job_status.name,
+            job_status=job_status.status,
+            created_at=job_status.created_date,
+            finished_at=job_status.end_timestamp if job_status.status == "SUCCESS" else None,
+            created_by=job_status.created_by,
+            # SAFELY ADDED OPTIONAL FIELDS
+            start_timestamp=start_timestamp,
+            end_timestamp=end_timestamp,
+            job_run_time=job_run_time,
         )
-    
-    @app.exception_handler(SQLAlchemyError)
-    async def sqlalchemy_exception_handler(request: Request, exc: SQLAlchemyError):
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={
-                "success": False,
-                "error": {
-                    "code": "DATABASE_ERROR",
-                    "message": "A database error occurred",
-                    "path": request.url.path
-                }
-            }
+
+
+class JobStatusUpdate(BaseModel):
+    job_status: str
+    finished_at: Optional[datetime.datetime]
+
+    @classmethod
+    def update_by_name(
+        cls, session: DBSession, name: str, job_status: "JobStatusUpdate"
+    ):
+        current_status = (
+            session.query(database.DQMonitoringJob)
+            .where(database.DQMonitoringJob.name == name)
+            .first()
         )
-    
-    @app.exception_handler(IntegrityError)
-    async def integrity_error_handler(request: Request, exc: IntegrityError):
-        return JSONResponse(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            content={
-                "success": False,
-                "error": {
-                    "code": "INTEGRITY_ERROR",
-                    "message": "Data integrity violation",
-                    "path": request.url.path
-                }
-            }
-        )
-    
-    @app.exception_handler(Exception)
-    async def general_exception_handler(request: Request, exc: Exception):
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={
-                "success": False,
-                "error": {
-                    "code": "INTERNAL_SERVER_ERROR",
-                    "message": "An unexpected error occurred",
-                    "path": request.url.path
-                }
-            }
-        )
+
+        if not current_status:
+            raise DoesNotExistsException("Job not found")
+
+        current_status.status = job_status.job_status
+
+        if job_status.finished_at:
+            current_status.end_timestamp = job_status.finished_at
+
+        session.commit()
+
+
+class JobResult(BaseModel):
+    result: Literal["passed", "failed"]
