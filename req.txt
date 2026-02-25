@@ -743,3 +743,520 @@ class JobStatusUpdate(BaseModel):
 
 class JobResult(BaseModel):
     result: Literal["passed", "failed"]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# test_dq_config_release.py - Add these test cases following the same pattern
+
+import datetime
+from datetime import timezone, timedelta
+import responses
+import json
+
+from dq_config_api import database
+from dq_config_api.enums import AccessType
+from dq_config_api.settings import get_settings
+
+
+
+
+@responses.activate
+def test_release_to_prod_after_edit_success(
+    db_session, auth_client, root_path, mock_gcs_manager_methods
+):
+    """Test: Config edited and successfully run - release should work"""
+    
+    team = db_session.get(database.Workspace, 1)
+    team.workspace_accesses.append(
+        database.WorkspaceAccess(
+            ad_group_name="AD_GROUP_1",
+            access_type=AccessType.APPROVER,
+        )
+    )
+    db_session.commit()
+
+    template_name = root_path / "data/DQ Config To Upload.xlsx"
+    response = auth_client.post(
+        "/workspace/api/v1/upload/1",
+        params={"validate_only": False},
+        files={
+            "file": ("DQ Config With Parameter Map.xlsx", open(template_name, "rb"))
+        },
+        data={"uploader_name": "Test User"},
+    )
+    assert response.status_code == 200, response.json()
+
+    config = db_session.query(database.Configuration).first()
+    config_id = config.id
+
+    # Add initial successful run
+    job_status = database.JobStatus(
+        configuration_id=config_id,
+        status="SUCCESS",
+        created_date=datetime.datetime.now(timezone.utc) - timedelta(days=2),
+        end_timestamp=datetime.datetime.now(timezone.utc) - timedelta(days=2, minutes=-30),
+        name="job_run_initial"
+    )
+    db_session.add(job_status)
+    db_session.commit()
+
+    # Edit the config
+    config.modified_at = datetime.datetime.now(timezone.utc) - timedelta(days=1)
+    config.modified_by = "Test Editor"
+    db_session.commit()
+
+    # Add successful run after edit
+    job_status_after = database.JobStatus(
+        configuration_id=config_id,
+        status="SUCCESS",
+        created_date=datetime.datetime.now(timezone.utc),
+        end_timestamp=datetime.datetime.now(timezone.utc) + timedelta(minutes=30),
+        name="job_run_after_edit"
+    )
+    db_session.add(job_status_after)
+    db_session.commit()
+
+    prod_url = get_settings().prod_url
+    responses.add(
+        responses.POST, f"{prod_url}/upload-to-prod/Test%20Team", status=200, json=200
+    )
+
+    assert (
+        db_session.query(database.Configuration)
+        .where(database.Configuration.released_to_prod)
+        .count()
+        == 0
+    )
+
+    response = auth_client.post(
+        f"/release-to-prod?config_id={config_id}&team_name=Test%20Team&workspace_name=Test%20Workspace&uploader_name=Test%20User",
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 200, response.content
+    mock_gcs_manager_methods["copy"].assert_called_once()
+
+    assert (
+        db_session.query(database.Configuration)
+        .where(database.Configuration.released_to_prod)
+        .count()
+        == 1
+    )
+
+
+
+
+@responses.activate
+def test_release_to_prod_after_edit_no_run(
+    db_session, auth_client, root_path, mock_gcs_manager_methods
+):
+    """Test: Config edited but no run after edit - release should fail"""
+    
+    team = db_session.get(database.Workspace, 1)
+    team.workspace_accesses.append(
+        database.WorkspaceAccess(
+            ad_group_name="AD_GROUP_1",
+            access_type=AccessType.APPROVER,
+        )
+    )
+    db_session.commit()
+
+    template_name = root_path / "data/DQ Config To Upload.xlsx"
+    response = auth_client.post(
+        "/workspace/api/v1/upload/1",
+        params={"validate_only": False},
+        files={
+            "file": ("DQ Config With Parameter Map.xlsx", open(template_name, "rb"))
+        },
+        data={"uploader_name": "Test User"},
+    )
+    assert response.status_code == 200, response.json()
+
+    config = db_session.query(database.Configuration).first()
+    config_id = config.id
+
+    # Add initial successful run
+    job_status = database.JobStatus(
+        configuration_id=config_id,
+        status="SUCCESS",
+        created_date=datetime.datetime.now(timezone.utc) - timedelta(days=2),
+        end_timestamp=datetime.datetime.now(timezone.utc) - timedelta(days=2, minutes=-30),
+        name="job_run_initial"
+    )
+    db_session.add(job_status)
+    db_session.commit()
+
+    # Edit the config
+    config.modified_at = datetime.datetime.now(timezone.utc)
+    config.modified_by = "Test Editor"
+    db_session.commit()
+
+    # NO RUN AFTER EDIT
+
+    prod_url = get_settings().prod_url
+    responses.add(
+        responses.POST, f"{prod_url}/upload-to-prod/Test%20Team", status=200, json=200
+    )
+
+    assert (
+        db_session.query(database.Configuration)
+        .where(database.Configuration.released_to_prod)
+        .count()
+        == 0
+    )
+
+    response = auth_client.post(
+        f"/release-to-prod?config_id={config_id}&team_name=Test%20Team&workspace_name=Test%20Workspace&uploader_name=Test%20User",
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 400, response.content
+    assert "No successful run after last edit" in response.json()["message"]
+
+    assert (
+        db_session.query(database.Configuration)
+        .where(database.Configuration.released_to_prod)
+        .count()
+        == 0
+    )
+
+
+
+
+@responses.activate
+def test_release_to_prod_after_edit_failed_run(
+    db_session, auth_client, root_path, mock_gcs_manager_methods
+):
+    """Test: Config edited but run after edit failed - release should fail"""
+    
+    team = db_session.get(database.Workspace, 1)
+    team.workspace_accesses.append(
+        database.WorkspaceAccess(
+            ad_group_name="AD_GROUP_1",
+            access_type=AccessType.APPROVER,
+        )
+    )
+    db_session.commit()
+
+    template_name = root_path / "data/DQ Config To Upload.xlsx"
+    response = auth_client.post(
+        "/workspace/api/v1/upload/1",
+        params={"validate_only": False},
+        files={
+            "file": ("DQ Config With Parameter Map.xlsx", open(template_name, "rb"))
+        },
+        data={"uploader_name": "Test User"},
+    )
+    assert response.status_code == 200, response.json()
+
+    config = db_session.query(database.Configuration).first()
+    config_id = config.id
+
+    # Add initial successful run
+    job_status = database.JobStatus(
+        configuration_id=config_id,
+        status="SUCCESS",
+        created_date=datetime.datetime.now(timezone.utc) - timedelta(days=2),
+        end_timestamp=datetime.datetime.now(timezone.utc) - timedelta(days=2, minutes=-30),
+        name="job_run_initial"
+    )
+    db_session.add(job_status)
+    db_session.commit()
+
+    # Edit the config
+    config.modified_at = datetime.datetime.now(timezone.utc) - timedelta(days=1)
+    config.modified_by = "Test Editor"
+    db_session.commit()
+
+    # Add FAILED run after edit
+    job_status_failed = database.JobStatus(
+        configuration_id=config_id,
+        status="FAILED",
+        created_date=datetime.datetime.now(timezone.utc),
+        end_timestamp=datetime.datetime.now(timezone.utc) + timedelta(minutes=5),
+        name="job_run_failed"
+    )
+    db_session.add(job_status_failed)
+    db_session.commit()
+
+    prod_url = get_settings().prod_url
+    responses.add(
+        responses.POST, f"{prod_url}/upload-to-prod/Test%20Team", status=200, json=200
+    )
+
+    assert (
+        db_session.query(database.Configuration)
+        .where(database.Configuration.released_to_prod)
+        .count()
+        == 0
+    )
+
+    response = auth_client.post(
+        f"/release-to-prod?config_id={config_id}&team_name=Test%20Team&workspace_name=Test%20Workspace&uploader_name=Test%20User",
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 400, response.content
+    assert "No successful run after last edit" in response.json()["message"]
+
+    assert (
+        db_session.query(database.Configuration)
+        .where(database.Configuration.released_to_prod)
+        .count()
+        == 0
+    )
+
+
+
+
+@responses.activate
+def test_release_to_prod_already_released_after_edit(
+    db_session, auth_client, root_path, mock_gcs_manager_methods
+):
+    """Test: Config already released but edited and re-run successfully - should allow release again"""
+    
+    team = db_session.get(database.Workspace, 1)
+    team.workspace_accesses.append(
+        database.WorkspaceAccess(
+            ad_group_name="AD_GROUP_1",
+            access_type=AccessType.APPROVER,
+        )
+    )
+    db_session.commit()
+
+    template_name = root_path / "data/DQ Config To Upload.xlsx"
+    response = auth_client.post(
+        "/workspace/api/v1/upload/1",
+        params={"validate_only": False},
+        files={
+            "file": ("DQ Config With Parameter Map.xlsx", open(template_name, "rb"))
+        },
+        data={"uploader_name": "Test User"},
+    )
+    assert response.status_code == 200, response.json()
+
+    config = db_session.query(database.Configuration).first()
+    config_id = config.id
+
+    # Mark as released to prod
+    config.released_to_prod = True
+    db_session.commit()
+
+    # Edit the config
+    config.modified_at = datetime.datetime.now(timezone.utc)
+    config.released_to_prod = False  # Reset released flag
+    config.modified_by = "Test Editor"
+    db_session.commit()
+
+    # Add successful run after edit
+    job_status = database.JobStatus(
+        configuration_id=config_id,
+        status="SUCCESS",
+        created_date=datetime.datetime.now(timezone.utc) + timedelta(hours=1),
+        end_timestamp=datetime.datetime.now(timezone.utc) + timedelta(hours=1, minutes=30),
+        name="job_run_after_edit"
+    )
+    db_session.add(job_status)
+    db_session.commit()
+
+    prod_url = get_settings().prod_url
+    responses.add(
+        responses.POST, f"{prod_url}/upload-to-prod/Test%20Team", status=200, json=200
+    )
+
+    assert (
+        db_session.query(database.Configuration)
+        .where(database.Configuration.released_to_prod)
+        .count()
+        == 0
+    )
+
+    response = auth_client.post(
+        f"/release-to-prod?config_id={config_id}&team_name=Test%20Team&workspace_name=Test%20Workspace&uploader_name=Test%20User",
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 200, response.content
+    mock_gcs_manager_methods["copy"].assert_called_once()
+
+    assert (
+        db_session.query(database.Configuration)
+        .where(database.Configuration.released_to_prod)
+        .count()
+        == 1
+    )
+
+
+
+
+@responses.activate
+def test_release_to_prod_multiple_edits_latest_success(
+    db_session, auth_client, root_path, mock_gcs_manager_methods
+):
+    """Test: Multiple edits, latest successful run after most recent edit"""
+    
+    team = db_session.get(database.Workspace, 1)
+    team.workspace_accesses.append(
+        database.WorkspaceAccess(
+            ad_group_name="AD_GROUP_1",
+            access_type=AccessType.APPROVER,
+        )
+    )
+    db_session.commit()
+
+    template_name = root_path / "data/DQ Config To Upload.xlsx"
+    response = auth_client.post(
+        "/workspace/api/v1/upload/1",
+        params={"validate_only": False},
+        files={
+            "file": ("DQ Config With Parameter Map.xlsx", open(template_name, "rb"))
+        },
+        data={"uploader_name": "Test User"},
+    )
+    assert response.status_code == 200, response.json()
+
+    config = db_session.query(database.Configuration).first()
+    config_id = config.id
+
+    # Initial successful run
+    job1 = database.JobStatus(
+        configuration_id=config_id,
+        status="SUCCESS",
+        created_date=datetime.datetime.now(timezone.utc) - timedelta(days=10),
+        end_timestamp=datetime.datetime.now(timezone.utc) - timedelta(days=10, minutes=-30),
+        name="job_run_1"
+    )
+    db_session.add(job1)
+    db_session.commit()
+
+    # First edit
+    config.modified_at = datetime.datetime.now(timezone.utc) - timedelta(days=8)
+    config.modified_by = "Editor 1"
+    db_session.commit()
+
+    # Run after first edit
+    job2 = database.JobStatus(
+        configuration_id=config_id,
+        status="SUCCESS",
+        created_date=datetime.datetime.now(timezone.utc) - timedelta(days=7),
+        end_timestamp=datetime.datetime.now(timezone.utc) - timedelta(days=7, minutes=-30),
+        name="job_run_2"
+    )
+    db_session.add(job2)
+    db_session.commit()
+
+    # Second edit
+    config.modified_at = datetime.datetime.now(timezone.utc) - timedelta(days=5)
+    config.modified_by = "Editor 2"
+    db_session.commit()
+
+    # Run after second edit (failed)
+    job3 = database.JobStatus(
+        configuration_id=config_id,
+        status="FAILED",
+        created_date=datetime.datetime.now(timezone.utc) - timedelta(days=4),
+        end_timestamp=datetime.datetime.now(timezone.utc) - timedelta(days=4, minutes=-5),
+        name="job_run_3"
+    )
+    db_session.add(job3)
+    db_session.commit()
+
+    # Third edit
+    config.modified_at = datetime.datetime.now(timezone.utc) - timedelta(days=2)
+    config.modified_by = "Editor 3"
+    db_session.commit()
+
+    # Latest run after third edit (success)
+    job4 = database.JobStatus(
+        configuration_id=config_id,
+        status="SUCCESS",
+        created_date=datetime.datetime.now(timezone.utc),
+        end_timestamp=datetime.datetime.now(timezone.utc) + timedelta(minutes=30),
+        name="job_run_4"
+    )
+    db_session.add(job4)
+    db_session.commit()
+
+    prod_url = get_settings().prod_url
+    responses.add(
+        responses.POST, f"{prod_url}/upload-to-prod/Test%20Team", status=200, json=200
+    )
+
+    assert (
+        db_session.query(database.Configuration)
+        .where(database.Configuration.released_to_prod)
+        .count()
+        == 0
+    )
+
+    response = auth_client.post(
+        f"/release-to-prod?config_id={config_id}&team_name=Test%20Team&workspace_name=Test%20Workspace&uploader_name=Test%20User",
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 200, response.content
+    mock_gcs_manager_methods["copy"].assert_called_once()
+
+    assert (
+        db_session.query(database.Configuration)
+        .where(database.Configuration.released_to_prod)
+        .count()
+        == 1
+    )
+    
+    # Verify it was the latest editor who released
+    released_config = db_session.query(database.Configuration).filter(
+        database.Configuration.released_to_prod == True
+    ).first()
+    assert released_config.modified_by == "Editor 3"
+
+
